@@ -7,6 +7,9 @@
 ///
 /// Single-node mode: No UCX/PMIx needed; operates on local memory directly.
 /// Multi-process mode: Full UCX stack with RMA atomics, PMIx for bootstrap.
+///
+/// UCC is used for collective operations (barrier, allreduce) replacing the
+/// previous tag-message-based barrier and verification reduction.
 
 use std::ffi::CString;
 
@@ -20,8 +23,16 @@ use ucx_sys::RequestParamBuilder;
 
 use pmix::{commit, fence, get_value, init, put_value, Context, GLOBAL, PmixValueBuilder, RANK_WILDCARD};
 
+use ucc::collective::{DataType, ReductionOp};
+use ucc::context::UccContext;
+use ucc::lib_init::UccLib;
+use ucc::team::{UccTeam, UccTeamParams};
+
 /// Tags for inter-process control traffic (reduction, verification, etc.).
+/// Kept for backward compatibility; barrier and allreduce now use UCC.
+#[allow(dead_code)]
 pub const TAG_SYNC: u64 = 0x3000;
+#[allow(dead_code)]
 pub const TAG_VERIFY: u64 = 0x4000;
 
 // PMIx key names for data exchange (null-terminated C strings)
@@ -44,7 +55,14 @@ pub fn create_single_node(rank: usize, size: usize) -> UpdateComm {
 /// Barrier for single-node mode (no-op).
 pub fn barrier_single(_comm: &UpdateComm) {}
 
+/// Allreduce for single-node mode (returns the local value unchanged).
+#[allow(dead_code)]
+pub fn allreduce_u64_single(_comm: &UpdateComm, value: u64) -> u64 {
+    value
+}
+
 /// Multi-process communication context using UCX RMA atomics + PMIx bootstrap.
+/// UCC is used for collective operations (barrier, allreduce).
 pub struct CommCtx {
     pub rank: usize,
     pub size: usize,
@@ -57,9 +75,15 @@ pub struct CommCtx {
     /// PMIx context — kept alive for the lifetime of this CommCtx.
     /// Drop calls PMIx_Finalize automatically.
     _pmix_ctx: Context,
+    /// UCC library handle for collective operations.
+    ucc_lib: UccLib,
+    /// UCC context for collective operations.
+    ucc_context: UccContext,
+    /// UCC team for collective operations (barrier, allreduce, etc.).
+    ucc_team: UccTeam,
 }
 
-/// Create a multi-process communication context using UCX + PMIx.
+/// Create a multi-process communication context using UCX + PMIx + UCC.
 ///
 /// Gets rank and size directly from PMIx (PMIx_Init + PMIX_JOB_SIZE query).
 /// No env vars needed — just call this function and it returns (rank, size, CommCtx).
@@ -72,14 +96,15 @@ pub struct CommCtx {
 /// 5. Publishes address/rkey/table_addr via PMIx_Put + PMIx_Commit + PMIx_Fence
 /// 6. Retrieves peer data via PMIx_Get
 /// 7. Creates UCX endpoints and unpacks remote rkeys
-/// 8. Returns a CommCtx ready for atomic XOR operations
+/// 8. Initializes UCC library, context, and team for collective operations
+/// 9. Returns a CommCtx ready for atomic XOR operations and collectives
 pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, usize, CommCtx) {
     // 1. Initialize PMIx — gets our rank
     let pmix_ctx = init(None).expect("PMIx init");
     let rank = pmix_ctx.get_rank() as usize;
     let my_proc = pmix_ctx.get_proc();
 
-     // 2. Query PMIX_JOB_SIZE via wildcard proc for total process count
+    // 2. Query PMIX_JOB_SIZE via wildcard proc for total process count
     // Fall back to PMIX_SIZE env var if PMIx doesn't publish it
     let wc_proc = pmix_ctx
         .proc_with_nspace(RANK_WILDCARD)
@@ -237,6 +262,21 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         flush_ep_blocking(&worker, &endpoints[peer], &flush_param);
     }
 
+    // 15. Initialize UCC for collective operations (barrier, allreduce, etc.)
+    let ucc_lib = UccLib::init().expect("UCC library init");
+    let ucc_context = UccContext::new(ucc_lib.clone()).expect("UCC context create");
+
+    // Create UCC team with explicit ep/size (no OOB needed since we know rank/size)
+    let mut ucc_team_params = UccTeamParams::default();
+    ucc_team_params.with_ep(rank as u64);
+    ucc_team_params.with_size(size as u64);
+    // Allow multiple outstanding collectives for better overlap
+    ucc_team_params.with_outstanding_colls(4);
+    let ucc_team = UccTeam::with_params(ucc_context.clone(), ucc_team_params)
+        .expect("UCC team create");
+
+    eprintln!("[gups-rs] UCC team created (rank={}, size={})", rank, size);
+
     let ctx = CommCtx {
         rank,
         size,
@@ -247,6 +287,9 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         remote_table_addrs,
         _memh: memh,
         _pmix_ctx: pmix_ctx,
+        ucc_lib,
+        ucc_context,
+        ucc_team,
     };
     (rank, size, ctx)
 }
@@ -281,80 +324,32 @@ pub fn progress(comm: &CommCtx) {
     }
 }
 
-/// Barrier across all processes using UCX tag messages.
+/// Barrier across all processes using UCC collective barrier.
+///
+/// Replaces the previous tag-message-based barrier with UCC's native
+/// barrier collective operation. This is more efficient and simpler.
 pub fn barrier(comm: &CommCtx) {
-    let rank = comm.rank;
-    let size = comm.size;
-    let worker = &comm.worker;
-    let endpoints = &comm.endpoints;
-
-    let param = RequestParamBuilder::new().no_imm_cmpl().build();
-    let recv_param = RequestParamBuilder::new().no_imm_cmpl().build();
-    let my_rank_bytes = (rank as u64).to_le_bytes();
-
-    // Send sync to all peers
-    for peer in 0..size {
-        if peer == rank {
-            continue;
-        }
-        send_blocking(&endpoints[peer], &my_rank_bytes, TAG_SYNC, worker, &param);
-    }
-
-    // Wait for sync from all peers
-    for peer in 0..size {
-        if peer == rank {
-            continue;
-        }
-        let mut buf = [0u8; 8];
-        recv_blocking(worker, &mut buf, TAG_SYNC, &recv_param);
-    }
+    let mut req = comm.ucc_team.barrier().expect("UCC barrier post");
+    req.wait().expect("UCC barrier wait");
 }
 
-/// Send a u64 value via tag message.
-pub fn send_u64(ep: &ep::Ep, value: u64, tag: u64) {
-    let param = RequestParamBuilder::new().no_imm_cmpl().build();
-    let bytes = value.to_le_bytes();
-    let _ = ep.tag_send(&bytes, tag, &param);
-}
-
-/// Receive a u64 value via tag message.
-pub fn recv_u64_value(worker: &worker::Worker, tag: u64) -> u64 {
-    let param = RequestParamBuilder::new().no_imm_cmpl().build();
-    let mut buf = [0u8; 8];
-    recv_blocking(worker, &mut buf, tag, &param);
-    u64::from_le_bytes(buf)
+/// Allreduce a u64 value across all processes using UCC collective allreduce.
+///
+/// Uses SUM reduction to aggregate values from all ranks. The result
+/// is the same on all processes after completion.
+///
+/// Replaces the previous tag-message-based reduction pattern where rank 0
+/// collected values from all other ranks via tag receive.
+pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
+    let mut buf = [value];
+    let mut req = comm.ucc_team
+        .allreduce_t::<u64>(&mut buf, DataType::Ullong, ReductionOp::Sum)
+        .expect("UCC allreduce post");
+    req.wait().expect("UCC allreduce wait");
+    buf[0]
 }
 
 // ── Internal helpers ──
-
-fn send_blocking(
-    ep: &ep::Ep,
-    data: &[u8],
-    tag: u64,
-    worker: &worker::Worker,
-    param: &ucx_sys::RequestParam,
-) {
-    let req = ep.tag_send(data, tag, param);
-    if let Ok(Some(r)) = req {
-        while !r.check_finished().unwrap_or(false) {
-            worker.progress();
-        }
-    }
-}
-
-fn recv_blocking(
-    worker: &worker::Worker,
-    buf: &mut [u8],
-    tag: u64,
-    param: &ucx_sys::RequestParam,
-) {
-    let mut req = worker.tag_recv(buf, tag, u64::MAX, param).expect("tag_recv");
-    if let Some(r) = req.take() {
-        while !r.check_finished().unwrap_or(false) {
-            worker.progress();
-        }
-    }
-}
 
 fn flush_ep_blocking(
     worker: &worker::Worker,

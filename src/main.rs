@@ -27,8 +27,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
-use comm::{atomic_xor_remote, barrier, create_multiprocess, create_single_node, progress, recv_u64_value, send_u64};
-use comm::{TAG_VERIFY, UpdateComm};
+use comm::{allreduce_u64, atomic_xor_remote, barrier, create_multiprocess, create_single_node, progress};
 use rng::{lfsr_step, starts};
 use table::{apply_update, init_table};
 
@@ -301,19 +300,8 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     );
     let verify_elapsed = Instant::now().duration_since(verify_start).as_secs_f64();
 
-    // Collect total errors via rank 0
-    let total_errors: u64 = if rank == 0 {
-        let mut total = errors;
-        for r in 1..size {
-            let r_errors = recv_u64_value(&comm_ctx.worker, TAG_VERIFY);
-            total += r_errors;
-        }
-        total
-    } else {
-        // Send our errors to rank 0
-        send_u64(&comm_ctx.endpoints[0], errors, TAG_VERIFY);
-        0
-    };
+    // Collect total errors via UCC allreduce (SUM reduction)
+    let total_errors: u64 = allreduce_u64(&comm_ctx, errors);
 
     barrier(&comm_ctx);
 

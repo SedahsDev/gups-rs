@@ -6,4 +6,5 @@ description = "GUPS benchmark in Rust using UCX"
 
 [dependencies]
 ucx-sys = { path = "../ucx/bindings/rust/" }
-pmix = { path = "../pmix-rs-wt-p4b4-topology" }
+pmix = { path = "../pmix-rs" }
+ucc = { path = "../ucc-rs" }
