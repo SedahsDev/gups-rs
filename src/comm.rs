@@ -13,13 +13,12 @@ use std::ffi::CString;
 use ucx_sys::context;
 use ucx_sys::ep;
 use ucx_sys::memh;
-use ucx_sys::rma;
-use ucx_sys::rma::ucp_rkey_h;
+use ucx_sys::rma::RemoteKey;
 use ucx_sys::worker;
 use ucx_sys::worker::RemoteWorkerAddress;
 use ucx_sys::RequestParamBuilder;
 
-use pmix::{commit, fence, get_value, init, put_value, Context, GLOBAL, PmixValueBuilder, Proc, RANK_WILDCARD};
+use pmix::{commit, fence, get_value, init, put_value, Context, GLOBAL, PmixValueBuilder, RANK_WILDCARD};
 
 /// Tags for inter-process control traffic (reduction, verification, etc.).
 pub const TAG_SYNC: u64 = 0x3000;
@@ -52,7 +51,7 @@ pub struct CommCtx {
     context: context::Context,
     pub worker: worker::Worker,
     pub endpoints: Vec<ep::Ep>,
-    remote_rkeys: Vec<ucp_rkey_h>,
+    remote_rkeys: Vec<Option<RemoteKey>>,
     remote_table_addrs: Vec<u64>,
     _memh: memh::MemHandle,
     /// PMIx context — kept alive for the lifetime of this CommCtx.
@@ -88,7 +87,7 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     let job_size_key_bytes = "PMIX_JOB_SIZE\0";
     let size = get_value(&wc_proc, job_size_key_bytes.as_bytes(), None)
         .ok()
-        .map(|v| unsafe { (*v.as_raw()).data.uint32 } as usize)
+        .map(|v| v.uint32() as usize)
         .or_else(|| std::env::var("PMIX_SIZE").ok().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| {
             panic!("Cannot determine job size from PMIx or PMIX_SIZE env var");
@@ -126,9 +125,7 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     let packed_rkey = memh::pack_rkey(&uctx, &memh).expect("Rkey pack");
     // ucp_rkey_pack returns: [4 bytes LE length][rkey data]
     // For ep_rkey_unpack, pass the raw buffer pointer directly
-    let rkey_data = unsafe {
-        std::slice::from_raw_parts(packed_rkey.as_ptr() as *const u8, packed_rkey.size())
-    };
+    let rkey_data = packed_rkey.as_bytes();
 
     // 8. Get our table address
     let table_addr = memh.query().expect("Memh query").address() as u64;
@@ -182,25 +179,19 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         let addr_key_bytes = format!("{}{}", PMIX_KEY_UCX_ADDR, '\0');
         let addr_val = get_value(&remote_proc, addr_key_bytes.as_bytes(), None)
             .expect("PMIx_Get addr");
-        let (ptr, len) = addr_val.bytes();
-        peer_addrs[peer] = unsafe {
-            std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
-        };
+        peer_addrs[peer] = addr_val.bytes_copy();
 
         // Get packed rkey (memory handle)
         let memh_key_bytes = format!("{}{}", PMIX_KEY_UCX_MEMH, '\0');
         let memh_val = get_value(&remote_proc, memh_key_bytes.as_bytes(), None)
             .expect("PMIx_Get memh");
-        let (ptr, len) = memh_val.bytes();
-        peer_memh_data[peer] = unsafe {
-            std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
-        };
+        peer_memh_data[peer] = memh_val.bytes_copy();
 
         // Get table address
         let table_key_bytes = format!("{}{}", PMIX_KEY_UCX_TABLE_ADDR, '\0');
         let table_val = get_value(&remote_proc, table_key_bytes.as_bytes(), None)
             .expect("PMIx_Get table_addr");
-        remote_table_addrs[peer] = unsafe { (*table_val.as_raw()).data.uint64 };
+        remote_table_addrs[peer] = table_val.uint64();
     }
 
     drop(packed_addr);
@@ -230,20 +221,14 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     }
 
     // 13. Unpack remote rkeys from cached memh data
-    let mut remote_rkeys = vec![std::ptr::null_mut::<std::ffi::c_void>() as ucp_rkey_h; size];
+    let mut remote_rkeys: Vec<Option<RemoteKey>> = (0..size).map(|_| None).collect();
     for peer in 0..size {
         if peer == rank {
             continue;
         }
-        let ep_handle = endpoints[peer].handle();
-        let rkey = unsafe {
-            rma::ep_rkey_unpack(
-                ep_handle,
-                peer_memh_data[peer].as_ptr() as *const std::os::raw::c_void,
-            )
-            .expect("rkey unpack")
-        };
-        remote_rkeys[peer] = rkey;
+        let rkey = RemoteKey::unpack(&endpoints[peer], &peer_memh_data[peer])
+            .expect("rkey unpack");
+        remote_rkeys[peer] = Some(rkey);
     }
 
     // 14. Flush all endpoints
@@ -273,20 +258,17 @@ pub fn atomic_xor_remote(
     offset: usize,
     value: u64,
 ) {
-    let ep_handle = comm.endpoints[peer].handle();
     let remote_addr =
         comm.remote_table_addrs[peer] + (offset * std::mem::size_of::<u64>()) as u64;
-    let rkey = comm.remote_rkeys[peer];
+    let rkey = comm.remote_rkeys[peer].as_ref().expect("rkey for peer");
 
     let param = RequestParamBuilder::new().build();
-    unsafe {
-        let result = rma::atomic_xor64(ep_handle, value, remote_addr, rkey, &param);
-        if let Err(e) = result {
-            eprintln!(
-                "atomic_xor64 failed on peer {} offset {}: {:?}",
-                peer, offset, e
-            );
-        }
+    let result = comm.endpoints[peer].amo_xor64(value, remote_addr, rkey, &param);
+    if let Err(e) = result {
+        eprintln!(
+            "atomic_xor64 failed on peer {} offset {}: {:?}",
+            peer, offset, e
+        );
     }
 }
 
@@ -341,22 +323,6 @@ pub fn recv_u64_value(worker: &worker::Worker, tag: u64) -> u64 {
     let mut buf = [0u8; 8];
     recv_blocking(worker, &mut buf, tag, &param);
     u64::from_le_bytes(buf)
-}
-
-/// Cleanup remote rkeys.
-impl Drop for CommCtx {
-    fn drop(&mut self) {
-        for peer in 0..self.size {
-            if peer == self.rank {
-                continue;
-            }
-            if !self.remote_rkeys[peer].is_null() {
-                unsafe {
-                    rma::rkey_destroy(self.remote_rkeys[peer]);
-                }
-            }
-        }
-    }
 }
 
 // ── Internal helpers ──
