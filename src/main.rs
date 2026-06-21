@@ -176,7 +176,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         .expect("wildcard_proc");
     let size = pmix::get_value(&wc_proc, "PMIX_JOB_SIZE\0".as_bytes(), None)
         .ok()
-        .map(|v| unsafe { (*v.as_raw()).data.uint32 } as usize)
+        .map(|v| v.uint32() as usize)
         .or_else(|| env::var("PMIX_SIZE").ok().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| {
             eprintln!("Cannot determine job size from PMIx or PMIX_SIZE env var.");
