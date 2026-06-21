@@ -1,0 +1,9 @@
+[package]
+name = "gups-rs"
+version = "0.1.0"
+edition = "2021"
+description = "GUPS benchmark in Rust using UCX"
+
+[dependencies]
+ucx-sys = { path = "../ucx/bindings/rust/" }
+pmix = { path = "../pmix-rs-wt-p4b4-topology" }
