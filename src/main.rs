@@ -27,7 +27,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
-use comm::{allreduce_u64, atomic_xor_remote, barrier, create_multiprocess, create_single_node, progress};
+use comm::{allreduce_u64, atomic_xor_remote, barrier, create_multiprocess, progress};
 use rng::{lfsr_step, starts};
 use table::{apply_update, init_table};
 
@@ -102,9 +102,13 @@ fn run_single(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         "PE Main table size = 2^{} = {} words/PE",
         log_table_local, local_table_size
     );
-    println!("Default number of updates (RECOMMENDED) = {}", default_updates);
+    println!(
+        "Default number of updates (RECOMMENDED) = {}",
+        default_updates
+    );
 
-    let mut ran = starts(4 * 0) as i64;
+    #[allow(clippy::erasing_op)]
+    let mut ran = starts(4 * 0);
     let local_mask = local_table_size - 1;
 
     let start = Instant::now();
@@ -147,7 +151,10 @@ fn run_single(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         "failed"
     };
 
-    println!("Verification:  Real time used = {:.6} seconds", verify_elapsed);
+    println!(
+        "Verification:  Real time used = {:.6} seconds",
+        verify_elapsed
+    );
     println!(
         "Found {} errors in {} locations ({}).",
         errors, table_size, status
@@ -224,7 +231,10 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
             "PE Main table size = 2^{} = {} words/PE",
             log_table_local, local_table_size
         );
-        println!("Default number of updates (RECOMMENDED) = {}", default_updates);
+        println!(
+            "Default number of updates (RECOMMENDED) = {}",
+            default_updates
+        );
     }
 
     // Phase 2: Full UCX + PMIx communication setup
@@ -258,7 +268,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         }
 
         // Periodically progress to ensure remote atomics complete
-        if (_iteration as usize) % 1024 == 0 {
+        if (_iteration as usize).is_multiple_of(1024) {
             progress(&comm_ctx);
         }
     }
@@ -312,7 +322,10 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
             "failed"
         };
 
-        println!("Verification:  Real time used = {:.6} seconds", verify_elapsed);
+        println!(
+            "Verification:  Real time used = {:.6} seconds",
+            verify_elapsed
+        );
         println!(
             "Found {} errors in {} locations ({}).",
             total_errors, table_size, status

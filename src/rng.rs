@@ -1,8 +1,8 @@
-/// LFSR-based random number generator matching the HPCC C reference.
-///
-/// Constants from RandomAccess.h:
-///   POLY   = 0x0000000000000007
-///   PERIOD = 1317624576693539401
+//! LFSR-based random number generator matching the HPCC C reference.
+//!
+//! Constants from RandomAccess.h:
+//!   POLY   = 0x0000000000000007
+//!   PERIOD = 1317624576693539401
 
 const POLY: i64 = 0x0000000000000007;
 const PERIOD: u64 = 1317624576693539401;
@@ -35,8 +35,8 @@ pub fn starts(n: u64) -> i64 {
     // m2[i] represents the state after 2^(i+1) steps
     let mut m2: [u64; 64] = [0; 64];
     let mut temp: u64 = 0x1;
-    for i in 0..64 {
-        m2[i] = temp;
+    for m in &mut m2 {
+        *m = temp;
         temp = lfsr_step(temp as i64) as u64;
         temp = lfsr_step(temp as i64) as u64;
     }
@@ -56,9 +56,9 @@ pub fn starts(n: u64) -> i64 {
     while i > 0 {
         // Compute ran = m2[0]*ran_bit0 ^ m2[1]*ran_bit1 ^ ... ^ m2[63]*ran_bit63
         let mut temp: u64 = 0;
-        for j in 0..64 {
+        for (j, m) in m2.iter().enumerate() {
             if (ran >> j) & 1 != 0 {
-                temp ^= m2[j];
+                temp ^= *m;
             }
         }
         ran = temp;

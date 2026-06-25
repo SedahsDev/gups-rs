@@ -2,7 +2,6 @@
 ///
 /// After the update phase, replay the RNG to determine the expected value of each
 /// table entry and compare against actual values.
-
 use crate::rng::{lfsr_step, starts};
 
 /// Verify the local table segment.
@@ -18,6 +17,7 @@ use crate::rng::{lfsr_step, starts};
 /// * `log_table_size` - log2(global table size)
 /// * `proc_num_updates` - Number of updates performed by each process
 /// * `my_proc` - This process's rank
+#[allow(clippy::too_many_arguments)]
 pub fn verify_table(
     table: &[u64],
     local_table_size: u64,
@@ -44,7 +44,7 @@ pub fn verify_table(
     // Replay all processes' update streams
     for proc_rank in 0..num_procs {
         // Initialize RNG for this process
-        let mut ran = starts(4 * global_start + proc_rank * 4) as i64;
+        let mut ran = starts(4 * global_start + proc_rank * 4);
 
         for _ in 0..proc_num_updates {
             ran = lfsr_step(ran);
@@ -60,7 +60,7 @@ pub fn verify_table(
 
     // Compare expected vs actual
     let mut errors: u64 = 0;
-    for (i, (&actual, &exp)) in table.iter().zip(expected.iter()).enumerate() {
+    for (&actual, &exp) in table.iter().zip(expected.iter()) {
         if actual != exp {
             errors += 1;
         }

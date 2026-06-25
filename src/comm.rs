@@ -10,7 +10,6 @@
 ///
 /// UCC is used for collective operations (barrier, allreduce) replacing the
 /// previous tag-message-based barrier and verification reduction.
-
 use std::ffi::CString;
 
 use ucx_sys::context;
@@ -21,11 +20,14 @@ use ucx_sys::worker;
 use ucx_sys::worker::RemoteWorkerAddress;
 use ucx_sys::RequestParamBuilder;
 
-use pmix::{commit, fence, get_value, init, put_value, Context, GLOBAL, PmixValueBuilder, RANK_WILDCARD};
+use pmix::{
+    commit, fence, get_value, init, put_value, Context, PmixValueBuilder, GLOBAL, RANK_WILDCARD,
+};
 
-use ucc::collective::{DataType, ReductionOp};
+use ucc::collective::{CollectiveBuilder, UccCollectiveType, UccReductionOp};
 use ucc::context::UccContext;
 use ucc::lib_init::UccLib;
+use ucc::memory::UccMemHandle;
 use ucc::team::{UccTeam, UccTeamParams};
 
 /// Tags for inter-process control traffic (reduction, verification, etc.).
@@ -47,14 +49,6 @@ pub struct UpdateComm {
     pub size: usize,
 }
 
-/// Create a single-node communication context.
-pub fn create_single_node(rank: usize, size: usize) -> UpdateComm {
-    UpdateComm { rank, size }
-}
-
-/// Barrier for single-node mode (no-op).
-pub fn barrier_single(_comm: &UpdateComm) {}
-
 /// Allreduce for single-node mode (returns the local value unchanged).
 #[allow(dead_code)]
 pub fn allreduce_u64_single(_comm: &UpdateComm, value: u64) -> u64 {
@@ -63,24 +57,25 @@ pub fn allreduce_u64_single(_comm: &UpdateComm, value: u64) -> u64 {
 
 /// Multi-process communication context using UCX RMA atomics + PMIx bootstrap.
 /// UCC is used for collective operations (barrier, allreduce).
+#[allow(dead_code)]
 pub struct CommCtx {
     pub rank: usize,
     pub size: usize,
-    context: context::Context,
-    pub worker: worker::Worker,
-    pub endpoints: Vec<ep::Ep>,
+    /// UCC team for collective operations (barrier, allreduce, etc.).
+    ucc_team: UccTeam,
+    /// UCC context for collective operations.
+    ucc_context: UccContext,
+    /// UCC library handle for collective operations.
+    ucc_lib: UccLib,
     remote_rkeys: Vec<Option<RemoteKey>>,
     remote_table_addrs: Vec<u64>,
     _memh: memh::MemHandle,
+    pub endpoints: Vec<ep::Ep>,
+    pub worker: worker::Worker,
+    context: context::Context,
     /// PMIx context — kept alive for the lifetime of this CommCtx.
     /// Drop calls PMIx_Finalize automatically.
     _pmix_ctx: Context,
-    /// UCC library handle for collective operations.
-    ucc_lib: UccLib,
-    /// UCC context for collective operations.
-    ucc_context: UccContext,
-    /// UCC team for collective operations (barrier, allreduce, etc.).
-    ucc_team: UccTeam,
 }
 
 /// Create a multi-process communication context using UCX + PMIx + UCC.
@@ -120,7 +115,10 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     eprintln!("[gups-rs] PMIx rank={}, size={}", rank, size);
 
     // 3. Initialize UCX context
-    let features = context::Flags::Tag | context::Flags::Rma | context::Flags::Amo64 | context::Flags::ExportedMemH;
+    let features = context::Flags::Tag
+        | context::Flags::Rma
+        | context::Flags::Amo64
+        | context::Flags::ExportedMemH;
     let ctx_params = context::ParamsBuilder::new()
         .features(features)
         .estimated_num_eps(size - 1)
@@ -194,28 +192,26 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     remote_table_addrs[rank] = table_addr;
 
     for peer in 0..size {
-        if peer == rank {
-            continue;
-        }
-
-        let remote_proc = pmix_ctx.proc_with_nspace(peer as u32).expect("proc_with_nspace");
+        let remote_proc = pmix_ctx
+            .proc_with_nspace(peer as u32)
+            .expect("proc_with_nspace");
 
         // Get worker address
         let addr_key_bytes = format!("{}{}", PMIX_KEY_UCX_ADDR, '\0');
-        let addr_val = get_value(&remote_proc, addr_key_bytes.as_bytes(), None)
-            .expect("PMIx_Get addr");
+        let addr_val =
+            get_value(&remote_proc, addr_key_bytes.as_bytes(), None).expect("PMIx_Get addr");
         peer_addrs[peer] = addr_val.bytes_copy();
 
         // Get packed rkey (memory handle)
         let memh_key_bytes = format!("{}{}", PMIX_KEY_UCX_MEMH, '\0');
-        let memh_val = get_value(&remote_proc, memh_key_bytes.as_bytes(), None)
-            .expect("PMIx_Get memh");
+        let memh_val =
+            get_value(&remote_proc, memh_key_bytes.as_bytes(), None).expect("PMIx_Get memh");
         peer_memh_data[peer] = memh_val.bytes_copy();
 
         // Get table address
         let table_key_bytes = format!("{}{}", PMIX_KEY_UCX_TABLE_ADDR, '\0');
-        let table_val = get_value(&remote_proc, table_key_bytes.as_bytes(), None)
-            .expect("PMIx_Get table_addr");
+        let table_val =
+            get_value(&remote_proc, table_key_bytes.as_bytes(), None).expect("PMIx_Get table_addr");
         remote_table_addrs[peer] = table_val.uint64();
     }
 
@@ -223,6 +219,7 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 
     // 12. Create UCX endpoints to each peer
     let mut endpoints = Vec::with_capacity(size);
+    #[allow(clippy::needless_range_loop)]
     for peer in 0..size {
         if peer == rank {
             // Self endpoint: create one to ourselves
@@ -251,29 +248,25 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         if peer == rank {
             continue;
         }
-        let rkey = RemoteKey::unpack(&endpoints[peer], &peer_memh_data[peer])
-            .expect("rkey unpack");
+        let rkey = RemoteKey::unpack(&endpoints[peer], &peer_memh_data[peer]).expect("rkey unpack");
         remote_rkeys[peer] = Some(rkey);
     }
 
     // 14. Flush all endpoints
     let flush_param = RequestParamBuilder::new().no_imm_cmpl().build();
-    for peer in 0..size {
-        flush_ep_blocking(&worker, &endpoints[peer], &flush_param);
+    for (_peer, ep) in endpoints.iter().enumerate().take(size) {
+        flush_ep_blocking(&worker, ep, &flush_param);
     }
 
     // 15. Initialize UCC for collective operations (barrier, allreduce, etc.)
     let ucc_lib = UccLib::init().expect("UCC library init");
     let ucc_context = UccContext::new(ucc_lib.clone()).expect("UCC context create");
 
-    // Create UCC team with explicit ep/size (no OOB needed since we know rank/size)
+    // Create UCC team with explicit size
     let mut ucc_team_params = UccTeamParams::default();
-    ucc_team_params.with_ep(rank as u64);
-    ucc_team_params.with_size(size as u64);
-    // Allow multiple outstanding collectives for better overlap
-    ucc_team_params.with_outstanding_colls(4);
-    let ucc_team = UccTeam::with_params(ucc_context.clone(), ucc_team_params)
-        .expect("UCC team create");
+    ucc_team_params.with_team_size(size as u64);
+    let ucc_team =
+        UccTeam::with_params(ucc_context.clone(), ucc_team_params).expect("UCC team create");
 
     eprintln!("[gups-rs] UCC team created (rank={}, size={})", rank, size);
 
@@ -295,14 +288,8 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 }
 
 /// Perform an atomic XOR on a remote peer's table entry.
-pub fn atomic_xor_remote(
-    comm: &CommCtx,
-    peer: usize,
-    offset: usize,
-    value: u64,
-) {
-    let remote_addr =
-        comm.remote_table_addrs[peer] + (offset * std::mem::size_of::<u64>()) as u64;
+pub fn atomic_xor_remote(comm: &CommCtx, peer: usize, offset: usize, value: u64) {
+    let remote_addr = comm.remote_table_addrs[peer] + (offset * std::mem::size_of::<u64>()) as u64;
     let rkey = comm.remote_rkeys[peer].as_ref().expect("rkey for peer");
 
     let param = RequestParamBuilder::new().build();
@@ -326,11 +313,18 @@ pub fn progress(comm: &CommCtx) {
 
 /// Barrier across all processes using UCC collective barrier.
 ///
-/// Replaces the previous tag-message-based barrier with UCC's native
-/// barrier collective operation. This is more efficient and simpler.
+/// Uses `init_and_post` which is synchronous — blocks until the collective
+/// completes. Replaces the previous tag-message-based barrier.
 pub fn barrier(comm: &CommCtx) {
-    let mut req = comm.ucc_team.barrier().expect("UCC barrier post");
-    req.wait().expect("UCC barrier wait");
+    let stub = [0u8];
+    let mem = UccMemHandle::map_slice(&comm.ucc_context, &stub).expect("UCC barrier src map");
+    let mut req = CollectiveBuilder::new(UccCollectiveType::Barrier)
+        .with_src(&mem)
+        .with_dst(&mem)
+        .with_count(1)
+        .init_and_post(&comm.ucc_team)
+        .expect("UCC barrier post");
+    let _ = req.finalize();
 }
 
 /// Allreduce a u64 value across all processes using UCC collective allreduce.
@@ -338,24 +332,34 @@ pub fn barrier(comm: &CommCtx) {
 /// Uses SUM reduction to aggregate values from all ranks. The result
 /// is the same on all processes after completion.
 ///
-/// Replaces the previous tag-message-based reduction pattern where rank 0
-/// collected values from all other ranks via tag receive.
+/// Uses `init_and_post` which is synchronous — blocks until the collective
+/// completes. Replaces the previous tag-message-based reduction pattern.
 pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
     let mut buf = [value];
-    let mut req = comm.ucc_team
-        .allreduce_t::<u64>(&mut buf, DataType::Ullong, ReductionOp::Sum)
+    let src_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr() as *const u8, std::mem::size_of::<u64>())
+    };
+    let dst_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, std::mem::size_of::<u64>())
+    };
+    let src = UccMemHandle::map_slice(&comm.ucc_context, src_bytes).expect("UCC allreduce src map");
+    let dst =
+        UccMemHandle::map_slice_mut(&comm.ucc_context, dst_bytes).expect("UCC allreduce dst map");
+    let mut req = CollectiveBuilder::new(UccCollectiveType::Allreduce)
+        .with_src(&src)
+        .with_dst(&dst)
+        .with_count(1)
+        .with_dtype(7) // UCC_DT_UINT64
+        .with_reduction_op(UccReductionOp::Sum)
+        .init_and_post(&comm.ucc_team)
         .expect("UCC allreduce post");
-    req.wait().expect("UCC allreduce wait");
+    let _ = req.finalize();
     buf[0]
 }
 
 // ── Internal helpers ──
 
-fn flush_ep_blocking(
-    worker: &worker::Worker,
-    ep: &ep::Ep,
-    param: &ucx_sys::RequestParam,
-) {
+fn flush_ep_blocking(worker: &worker::Worker, ep: &ep::Ep, param: &ucx_sys::RequestParam) {
     // Flush via the endpoint by flushing the worker — UCX flush is worker-wide
     // but we call it once per endpoint to be safe in the original pattern.
     // Actually, worker.flush() flushes all AM/RMA on this worker.
