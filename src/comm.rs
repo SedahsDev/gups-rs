@@ -371,3 +371,191 @@ fn flush_ep_blocking(worker: &worker::Worker, ep: &ep::Ep, param: &ucx_sys::Requ
     }
     let _ = ep; // ep passed for API compatibility
 }
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Single-node (UpdateComm) tests ──
+
+    /// UpdateComm can be constructed with arbitrary rank/size values.
+    #[test]
+    fn test_update_comm_creation() {
+        let comm = UpdateComm { rank: 0, size: 1 };
+        assert_eq!(comm.rank, 0);
+        assert_eq!(comm.size, 1);
+    }
+
+    /// UpdateComm with non-zero rank.
+    #[test]
+    fn test_update_comm_nonzero_rank() {
+        let comm = UpdateComm {
+            rank: 42,
+            size: 128,
+        };
+        assert_eq!(comm.rank, 42);
+        assert_eq!(comm.size, 128);
+    }
+
+    // ── Single-node allreduce tests ──
+
+    /// Single-node allreduce returns the input value unchanged.
+    #[test]
+    fn test_allreduce_u64_single_identity() {
+        let comm = UpdateComm { rank: 0, size: 1 };
+        assert_eq!(allreduce_u64_single(&comm, 42), 42);
+    }
+
+    /// Single-node allreduce with zero.
+    #[test]
+    fn test_allreduce_u64_single_zero() {
+        let comm = UpdateComm { rank: 0, size: 1 };
+        assert_eq!(allreduce_u64_single(&comm, 0), 0);
+    }
+
+    /// Single-node allreduce with max u64.
+    #[test]
+    fn test_allreduce_u64_single_max() {
+        let comm = UpdateComm { rank: 0, size: 1 };
+        assert_eq!(allreduce_u64_single(&comm, u64::MAX), u64::MAX);
+    }
+
+    /// Single-node allreduce ignores comm fields (rank/size don't matter).
+    #[test]
+    fn test_allreduce_u64_single_ignores_comm() {
+        let comm = UpdateComm {
+            rank: 99,
+            size: 256,
+        };
+        assert_eq!(allreduce_u64_single(&comm, 12345), 12345);
+    }
+
+    // ── Tag constant tests ──
+
+    /// TAG_SYNC and TAG_VERIFY have distinct, non-zero values.
+    #[test]
+    fn test_tag_constants() {
+        assert_eq!(TAG_SYNC, 0x3000);
+        assert_eq!(TAG_VERIFY, 0x4000);
+        assert_ne!(TAG_SYNC, TAG_VERIFY);
+        assert!(TAG_SYNC > 0);
+        assert!(TAG_VERIFY > 0);
+    }
+
+    // ── PMIx key constant tests ──
+
+    /// PMIx key constants are correct and distinct.
+    #[test]
+    fn test_pmix_key_constants() {
+        assert_eq!(PMIX_KEY_UCX_ADDR, "gups.ucx.addr");
+        assert_eq!(PMIX_KEY_UCX_MEMH, "gups.ucx.memh");
+        assert_eq!(PMIX_KEY_UCX_TABLE_ADDR, "gups.ucx.table_addr");
+    }
+
+    // ── Multi-process tests (require DVM — marked #[ignore]) ──
+
+    /// create_multiprocess initializes UCX + PMIx + UCC and returns valid rank/size.
+    ///
+    /// #[ignore] — requires PMIx daemon (prrte) to be running.
+    #[test]
+    #[ignore = "requires PMIx daemon (prrte) for multi-process bootstrap"]
+    fn test_create_multiprocess() {
+        let table: Vec<u64> = vec![0; 1024];
+        let table_ptr = table.as_ptr() as *mut u64;
+        let table_bytes = 1024 * std::mem::size_of::<u64>();
+
+        let (rank, size, ctx) = create_multiprocess(table_ptr, table_bytes);
+
+        assert!(rank < size, "rank {} must be less than size {}", rank, size);
+        assert!(size > 0, "size must be positive");
+        assert_eq!(ctx.rank, rank);
+        assert_eq!(ctx.size, size);
+        assert_eq!(ctx.endpoints.len(), size);
+        assert_eq!(ctx.remote_rkeys.len(), size);
+        assert_eq!(ctx.remote_table_addrs.len(), size);
+    }
+
+    /// atomic_xor_remote performs XOR on a peer's table entry.
+    ///
+    /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
+    #[test]
+    #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    fn test_atomic_xor_remote() {
+        let table: Vec<u64> = vec![0; 1024];
+        let table_ptr = table.as_ptr() as *mut u64;
+        let table_bytes = 1024 * std::mem::size_of::<u64>();
+
+        let (_rank, _size, ctx) = create_multiprocess(table_ptr, table_bytes);
+
+        // XOR with self (peer == rank) — should work since self EP exists
+        atomic_xor_remote(&ctx, ctx.rank, 0, 0xDEADBEEF);
+        progress(&ctx);
+        // In single-process mode, the self-XOR should be visible locally
+        // (this verifies the atomic operation path compiles and runs)
+    }
+
+    /// barrier() completes without panic using UCC collective.
+    ///
+    /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
+    #[test]
+    #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    fn test_barrier_multiprocess() {
+        let table: Vec<u64> = vec![0; 1024];
+        let table_ptr = table.as_ptr() as *mut u64;
+        let table_bytes = 1024 * std::mem::size_of::<u64>();
+
+        let (_rank, _size, ctx) = create_multiprocess(table_ptr, table_bytes);
+
+        // Barrier should complete without panic
+        barrier(&ctx);
+    }
+
+    /// allreduce_u64 sums values across all processes using UCC.
+    ///
+    /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
+    #[test]
+    #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    fn test_allreduce_u64_multiprocess() {
+        let table: Vec<u64> = vec![0; 1024];
+        let table_ptr = table.as_ptr() as *mut u64;
+        let table_bytes = 1024 * std::mem::size_of::<u64>();
+
+        let (rank, size, ctx) = create_multiprocess(table_ptr, table_bytes);
+
+        // Each rank contributes its rank number; sum should be 0+1+...+(size-1)
+        let value = rank as u64;
+        let result = allreduce_u64(&ctx, value);
+        let expected: u64 = (0..size as u64).sum();
+        assert_eq!(
+            result, expected,
+            "allreduce SUM should equal sum of all ranks"
+        );
+    }
+
+    /// CommCtx endpoints and rkeys arrays have correct size.
+    ///
+    /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
+    #[test]
+    #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    fn test_commctx_array_sizes() {
+        let table: Vec<u64> = vec![0; 1024];
+        let table_ptr = table.as_ptr() as *mut u64;
+        let table_bytes = 1024 * std::mem::size_of::<u64>();
+
+        let (_rank, size, ctx) = create_multiprocess(table_ptr, table_bytes);
+
+        assert_eq!(ctx.endpoints.len(), size, "endpoints array size mismatch");
+        assert_eq!(
+            ctx.remote_rkeys.len(),
+            size,
+            "remote_rkeys array size mismatch"
+        );
+        assert_eq!(
+            ctx.remote_table_addrs.len(),
+            size,
+            "remote_table_addrs array size mismatch"
+        );
+    }
+}
