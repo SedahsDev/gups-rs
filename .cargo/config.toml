@@ -1,0 +1,5 @@
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native", "-C", "link-args=-L/home/bzf/.local/ucx/lib", "-C", "link-args=-L/home/bzf/projects/prrte/scratch/install/lib", "-C", "link-args=-Wl,-rpath,/home/bzf/.local/ucx/lib:/home/bzf/projects/prrte/scratch/install/lib"]
+
+[env]
+LD_LIBRARY_PATH = { value = "/home/bzf/.local/ucx/lib:/home/bzf/projects/prrte/scratch/install/lib", force = true }
