@@ -5,6 +5,7 @@ edition = "2021"
 description = "GUPS benchmark in Rust using UCX"
 
 [dependencies]
+libc = "0.2"
 ucx-sys = { path = "../ucx/bindings/rust/" }
 pmix = { path = "../pmix-rs" }
 ucc = { path = "../ucc-rs" }

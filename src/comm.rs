@@ -84,11 +84,20 @@ pub struct CommCtx {
 /// OpenPMIX 6.1.0 ignores `PMIX_SERVER_URI` set via `std::env::set_var`,
 /// so we read the URI ourselves and pass it through `info_with_string_key`.
 ///
-/// Lookup order:
+/// Only resolves when running under a PRTE daemon (detected via PMIX_RANK env var).
+/// Standalone single-process runs fall back to bare `PMIx_Init`.
+///
+/// Lookup order (when under prterun):
 /// 1. `PMIX_SERVER_URI` environment variable
 /// 2. URI file at `/run/user/{uid}/prte/uri`
 /// 3. `None` if neither is available (bare `PMIx_Init` as before)
 fn resolve_pmix_server_uri() -> Option<String> {
+    // Only resolve URI when running under prterun (PMIX_RANK is set by the daemon)
+    // Standalone runs should use init(None) to avoid connecting to stale URIs
+    if std::env::var("PMIX_RANK").is_err() {
+        return None;
+    }
+
     // 1. Check environment variable
     if let Ok(uri) = std::env::var("PMIX_SERVER_URI") {
         if !uri.is_empty() {
@@ -96,7 +105,8 @@ fn resolve_pmix_server_uri() -> Option<String> {
         }
     }
     // 2. Read URI file from systemd runtime directory
-    let uid = std::process::id();
+    // Use getuid() not getpid() — the URI lives under /run/user/{uid}/
+    let uid = unsafe { libc::getuid() };
     let uri_path = format!("/run/user/{}/prte/uri", uid);
     if let Ok(content) = std::fs::read_to_string(&uri_path) {
         let uri = content.lines().next()?.trim().to_string();
