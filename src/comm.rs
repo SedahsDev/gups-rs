@@ -21,7 +21,8 @@ use ucx_sys::worker::RemoteWorkerAddress;
 use ucx_sys::RequestParamBuilder;
 
 use pmix::{
-    commit, fence, get_value, init, put_value, Context, PmixValueBuilder, GLOBAL, RANK_WILDCARD,
+    commit, fence, get_value, info_with_string_key, init, put_value, Context, PmixValueBuilder,
+    GLOBAL, RANK_WILDCARD,
 };
 
 use ucc::collective::{CollectiveBuilder, UccCollectiveType, UccReductionOp};
@@ -78,6 +79,34 @@ pub struct CommCtx {
     _pmix_ctx: Context,
 }
 
+/// Resolve the PMIx server URI from environment or local file.
+///
+/// OpenPMIX 6.1.0 ignores `PMIX_SERVER_URI` set via `std::env::set_var`,
+/// so we read the URI ourselves and pass it through `info_with_string_key`.
+///
+/// Lookup order:
+/// 1. `PMIX_SERVER_URI` environment variable
+/// 2. URI file at `/run/user/{uid}/prte/uri`
+/// 3. `None` if neither is available (bare `PMIx_Init` as before)
+fn resolve_pmix_server_uri() -> Option<String> {
+    // 1. Check environment variable
+    if let Ok(uri) = std::env::var("PMIX_SERVER_URI") {
+        if !uri.is_empty() {
+            return Some(uri);
+        }
+    }
+    // 2. Read URI file from systemd runtime directory
+    let uid = std::process::id();
+    let uri_path = format!("/run/user/{}/prte/uri", uid);
+    if let Ok(content) = std::fs::read_to_string(&uri_path) {
+        let uri = content.lines().next()?.trim().to_string();
+        if !uri.is_empty() {
+            return Some(uri);
+        }
+    }
+    None
+}
+
 /// Create a multi-process communication context using UCX + PMIx + UCC.
 ///
 /// Gets rank and size directly from PMIx (PMIx_Init + PMIX_JOB_SIZE query).
@@ -95,7 +124,10 @@ pub struct CommCtx {
 /// 9. Returns a CommCtx ready for atomic XOR operations and collectives
 pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, usize, CommCtx) {
     // 1. Initialize PMIx — gets our rank
-    let pmix_ctx = init(None).expect("PMIx init");
+    // Pass server URI explicitly (OpenPMIX 6.1.0 ignores env vars for this)
+    let pmix_info =
+        resolve_pmix_server_uri().map(|uri| info_with_string_key("pmix.srvr.uri", &uri));
+    let pmix_ctx = init(pmix_info).expect("PMIx init");
     let rank = pmix_ctx.get_rank() as usize;
     let my_proc = pmix_ctx.get_proc();
 
