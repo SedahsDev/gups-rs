@@ -88,9 +88,11 @@ pub struct CommCtx {
 /// Standalone single-process runs fall back to bare `PMIx_Init`.
 ///
 /// Lookup order (when under prterun):
-/// 1. `PMIX_SERVER_URI` environment variable
-/// 2. URI file at `/run/user/{uid}/prte/uri`
-/// 3. `None` if neither is available (bare `PMIx_Init` as before)
+/// 1. Versioned env vars: PMIX_SERVER_URI61, PMIX_SERVER_URI51, PMIX_SERVER_URI41, etc.
+///    (prterun sets these — they point to the correct session daemon)
+/// 2. Unversioned PMIX_SERVER_URI env var
+/// 3. URI file at `/run/user/{uid}/prte/uri`
+/// 4. `None` if none are available (bare `PMIx_Init` as before)
 fn resolve_pmix_server_uri() -> Option<String> {
     // Only resolve URI when running under prterun (PMIX_RANK is set by the daemon)
     // Standalone runs should use init(None) to avoid connecting to stale URIs
@@ -98,13 +100,33 @@ fn resolve_pmix_server_uri() -> Option<String> {
         return None;
     }
 
-    // 1. Check environment variable
+    // 1. Check versioned env vars (prterun sets PMIX_SERVER_URI61, PMIX_SERVER_URI51, etc.)
+    // These point to the correct session daemon, not the system daemon
+    for key in [
+        "PMIX_SERVER_URI61",
+        "PMIX_SERVER_URI51",
+        "PMIX_SERVER_URI41",
+        "PMIX_SERVER_URI4",
+        "PMIX_SERVER_URI3",
+        "PMIX_SERVER_URI21",
+        "PMIX_SERVER_URI20",
+        "PMIX_SERVER_URI12",
+    ] {
+        if let Ok(uri) = std::env::var(key) {
+            if !uri.is_empty() {
+                return Some(uri);
+            }
+        }
+    }
+
+    // 2. Check unversioned env var
     if let Ok(uri) = std::env::var("PMIX_SERVER_URI") {
         if !uri.is_empty() {
             return Some(uri);
         }
     }
-    // 2. Read URI file from systemd runtime directory
+
+    // 3. Read URI file from systemd runtime directory
     // Use getuid() not getpid() — the URI lives under /run/user/{uid}/
     let uid = unsafe { libc::getuid() };
     let uri_path = format!("/run/user/{}/prte/uri", uid);
