@@ -1,6 +1,10 @@
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
+    "-L", "/home/bzf/.local/ucx/lib",
     "-L", "/home/bzf/.local/ucc/lib",
-    "-L", "/usr/lib/x86_64-linux-gnu/ucx",
+    "-L", "/home/bzf/projects/prrte/scratch/install/lib",
+    "-C", "link-arg=-Wl,--disable-new-dtags",
+    "-C", "link-arg=-Wl,-rpath,/home/bzf/.local/ucx/lib",
     "-C", "link-arg=-Wl,-rpath,/home/bzf/.local/ucc/lib",
+    "-C", "link-arg=-Wl,-rpath,/home/bzf/projects/prrte/scratch/install/lib",
 ]

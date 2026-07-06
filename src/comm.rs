@@ -79,54 +79,29 @@ pub struct CommCtx {
     _pmix_ctx: Context,
 }
 
-/// Resolve the PMIx server URI from environment or local file.
+/// Resolve the PMIx server URI from the local URI file for standalone clients.
 ///
-/// OpenPMIX 6.1.0 ignores `PMIX_SERVER_URI` set via `std::env::set_var`,
-/// so we read the URI ourselves and pass it through `info_with_string_key`.
+/// When running under `prterun`, PMIx_Init finds the server automatically via the
+/// environment variables that prterun sets (PMIX_RANK, PMIX_SERVER_URI61, etc.).
+/// The C library reads these internally — no explicit URI needed.
 ///
-/// Only resolves when running under a PRTE daemon (detected via PMIX_RANK env var).
-/// Standalone single-process runs fall back to bare `PMIx_Init`.
+/// **CRITICAL:** Do NOT pass `pmix.srvr.uri` to `PMIx_Init` when under prterun.
+/// That key is for `PMIx_Tool_Init`, and passing it to `PMIx_Init` causes
+/// ErrUnreach or segfault with OpenPMIX 6.1.0.
 ///
-/// Lookup order (when under prterun):
-/// 1. Versioned env vars: PMIX_SERVER_URI61, PMIX_SERVER_URI51, PMIX_SERVER_URI41, etc.
-///    (prterun sets these — they point to the correct session daemon)
-/// 2. Unversioned PMIX_SERVER_URI env var
-/// 3. URI file at `/run/user/{uid}/prte/uri`
-/// 4. `None` if none are available (bare `PMIx_Init` as before)
+/// Only resolve the URI file when NOT under prterun (standalone mode) and a
+/// system server daemon is running. This avoids connecting to stale daemons.
+///
+/// Lookup: URI file at `/run/user/{uid}/prte/uri`
 fn resolve_pmix_server_uri() -> Option<String> {
-    // Only resolve URI when running under prterun (PMIX_RANK is set by the daemon)
-    // Standalone runs should use init(None) to avoid connecting to stale URIs
-    if std::env::var("PMIX_RANK").is_err() {
+    // When running under prterun, let PMIx_Init discover the server via env vars.
+    // Do NOT pass pmix.srvr.uri to PMIx_Init — that key is for PMIx_Tool_Init,
+    // and passing it to PMIx_Init causes ErrUnreach/segfault with OpenPMIX 6.1.0.
+    if std::env::var("PMIX_RANK").is_ok() {
         return None;
     }
 
-    // 1. Check versioned env vars (prterun sets PMIX_SERVER_URI61, PMIX_SERVER_URI51, etc.)
-    // These point to the correct session daemon, not the system daemon
-    for key in [
-        "PMIX_SERVER_URI61",
-        "PMIX_SERVER_URI51",
-        "PMIX_SERVER_URI41",
-        "PMIX_SERVER_URI4",
-        "PMIX_SERVER_URI3",
-        "PMIX_SERVER_URI21",
-        "PMIX_SERVER_URI20",
-        "PMIX_SERVER_URI12",
-    ] {
-        if let Ok(uri) = std::env::var(key) {
-            if !uri.is_empty() {
-                return Some(uri);
-            }
-        }
-    }
-
-    // 2. Check unversioned env var
-    if let Ok(uri) = std::env::var("PMIX_SERVER_URI") {
-        if !uri.is_empty() {
-            return Some(uri);
-        }
-    }
-
-    // 3. Read URI file from systemd runtime directory
+    // Standalone mode: try to connect to a running system server via URI file
     // Use getuid() not getpid() — the URI lives under /run/user/{uid}/
     let uid = unsafe { libc::getuid() };
     let uri_path = format!("/run/user/{}/prte/uri", uid);
@@ -142,7 +117,9 @@ fn resolve_pmix_server_uri() -> Option<String> {
 /// Create a multi-process communication context using UCX + PMIx + UCC.
 ///
 /// Gets rank and size directly from PMIx (PMIx_Init + PMIX_JOB_SIZE query).
-/// No env vars needed — just call this function and it returns (rank, size, CommCtx).
+/// When launched under prterun, PMIx discovers the server automatically via
+/// environment variables — no explicit URI needed. Standalone runs resolve
+/// the URI from the local file if a system server is running.
 ///
 /// This function:
 /// 1. Initializes PMIx for rank/namespace discovery
@@ -156,7 +133,8 @@ fn resolve_pmix_server_uri() -> Option<String> {
 /// 9. Returns a CommCtx ready for atomic XOR operations and collectives
 pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, usize, CommCtx) {
     // 1. Initialize PMIx — gets our rank
-    // Pass server URI explicitly (OpenPMIX 6.1.0 ignores env vars for this)
+    // When under prterun: init(None) lets the C library discover the server via env vars
+    // When standalone: resolve_pmix_server_uri() tries the system server URI file
     let pmix_info =
         resolve_pmix_server_uri().map(|uri| info_with_string_key("pmix.srvr.uri", &uri));
     let pmix_ctx = init(pmix_info).expect("PMIx init");
@@ -168,21 +146,19 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     let wc_proc = pmix_ctx
         .proc_with_nspace(RANK_WILDCARD)
         .expect("wildcard_proc");
-    let job_size_key_bytes = "PMIX_JOB_SIZE\0";
-    let size = get_value(&wc_proc, job_size_key_bytes.as_bytes(), None)
+    let size = get_value(&wc_proc, pmix::JOB_SIZE, None)
         .ok()
         .map(|v| v.uint32() as usize)
         .or_else(|| std::env::var("PMIX_SIZE").ok().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| {
-            panic!("Cannot determine job size from PMIx or PMIX_SIZE env var");
+            panic!("Cannot determine job size from PMIx (pmix.job.size) or PMIX_SIZE env var");
         });
     eprintln!("[gups-rs] PMIx rank={}, size={}", rank, size);
 
     // 3. Initialize UCX context
-    let features = context::Flags::Tag
-        | context::Flags::Rma
-        | context::Flags::Amo64
-        | context::Flags::ExportedMemH;
+    // Tag + Rma + ExportedMemH — Amo64 not needed as a context flag;
+    // amo_xor64 works on RMA endpoints without explicit Amo64 feature.
+    let features = context::Flags::Tag | context::Flags::Rma | context::Flags::ExportedMemH;
     let ctx_params = context::ParamsBuilder::new()
         .features(features)
         .estimated_num_eps(size - 1)

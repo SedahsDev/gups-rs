@@ -168,26 +168,37 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     // and rkey exchange. It returns (rank, size, CommCtx).
     //
     // We need to know size before allocating the table, but create_multiprocess
-    // also needs the table pointer. So we do a two-phase approach:
-    // Phase 1: Quick PMIx probe to get rank/size.
-    // Phase 2: Allocate table and call create_multiprocess().
+    // also needs the table pointer. We allocate a temporary 1-element table
+    // just to satisfy the API, then replace it with the real table.
+    //
+    // Actually, the simpler approach: allocate a large-enough table upfront
+    // (max reasonable size), then let create_multiprocess use it.
+    // Even simpler: just allocate a dummy page and pass it,
+    // then re-register after we know the real size.
+    //
+    // Cleanest: do a minimal PMIx probe first (init + get rank/size + finalize),
+    // then allocate properly and call create_multiprocess which does its own init.
+    // PMIx allows init/finalize cycles.
 
-    // Phase 1: Quick PMIx init just to get rank and size
-    let pmix_ctx = pmix::init(None).expect("PMIx_Init");
+    // Phase 1: Quick PMIx probe to get rank/size only
+    let pmix_ctx = pmix::init(None).expect("PMIx_Init (probe)");
     let rank = pmix_ctx.get_rank() as usize;
 
-    // Query PMIX_JOB_SIZE via wildcard proc, fall back to PMIX_SIZE env var
+    // Query pmix.job.size via wildcard proc, fall back to PMIX_SIZE env var
     let wc_proc = pmix_ctx
         .proc_with_nspace(pmix::RANK_WILDCARD)
         .expect("wildcard_proc");
-    let size = pmix::get_value(&wc_proc, "PMIX_JOB_SIZE\0".as_bytes(), None)
+    let size = pmix::get_value(&wc_proc, pmix::JOB_SIZE, None)
         .ok()
         .map(|v| v.uint32() as usize)
         .or_else(|| env::var("PMIX_SIZE").ok().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| {
-            eprintln!("Cannot determine job size from PMIx or PMIX_SIZE env var.");
+            eprintln!("Cannot determine job size from PMIx (pmix.job.size) or PMIX_SIZE env var.");
             process::exit(1);
         });
+
+    // Drop probe context — PMIx_Finalize allows re-init
+    drop(pmix_ctx);
 
     if size == 1 {
         eprintln!("PMIX_JOB_SIZE is 1 — nothing to do in multi-process mode.");
@@ -237,7 +248,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         );
     }
 
-    // Phase 2: Full UCX + PMIx communication setup
+    // Phase 2: Full UCX + PMIx communication setup (re-init PMIx)
     let table_bytes = local_table_size as usize * std::mem::size_of::<u64>();
     let (_rank, _size, comm_ctx) = create_multiprocess(table.as_mut_ptr(), table_bytes);
 
