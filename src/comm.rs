@@ -71,7 +71,8 @@ pub struct CommCtx {
     remote_rkeys: Vec<Option<RemoteKey>>,
     remote_table_addrs: Vec<u64>,
     _memh: memh::MemHandle,
-    pub endpoints: Vec<ep::Ep>,
+    /// UCX endpoints — `None` for self (rank == peer), `Some(ep)` for remote peers.
+    pub endpoints: Vec<Option<ep::Ep>>,
     pub worker: worker::Worker,
     context: context::Context,
     /// PMIx context — kept alive for the lifetime of this CommCtx.
@@ -257,23 +258,16 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 
     drop(packed_addr);
 
-    // 12. Create UCX endpoints to each peer
-    let mut endpoints = Vec::with_capacity(size);
-    #[allow(clippy::needless_range_loop)]
-    for peer in 0..size {
-        if peer == rank {
-            // Self endpoint: create one to ourselves
-            let own_remote_addr = RemoteWorkerAddress::new(own_addr_bytes.clone());
-            let ep_params = ep::ParamsBuilder::new().address(&own_remote_addr).build();
-            let ep = worker.create_ep(ep_params).expect("Self EP create");
-            endpoints.push(ep);
-            continue;
+    // 12. Create UCX endpoints to each peer (skip self — local updates go direct)
+    let endpoints: Vec<Option<ep::Ep>> = (0..size).map(|p| {
+        if p == rank {
+            None // No self-endpoint needed — local updates are direct memory access
+        } else {
+            let remote_addr = RemoteWorkerAddress::new(peer_addrs[p].clone());
+            let ep_params = ep::ParamsBuilder::new().address(&remote_addr).build();
+            Some(worker.create_ep(ep_params).expect("EP create for peer"))
         }
-        let remote_addr = RemoteWorkerAddress::new(peer_addrs[peer].clone());
-        let ep_params = ep::ParamsBuilder::new().address(&remote_addr).build();
-        let ep = worker.create_ep(ep_params).expect("EP create for peer");
-        endpoints.push(ep);
-    }
+    }).collect();
 
     // Progress endpoint connections
     loop {
@@ -288,14 +282,16 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         if peer == rank {
             continue;
         }
-        let rkey = RemoteKey::unpack(&endpoints[peer], &peer_memh_data[peer]).expect("rkey unpack");
+        let rkey = RemoteKey::unpack(endpoints[peer].as_ref().unwrap(), &peer_memh_data[peer]).expect("rkey unpack");
         remote_rkeys[peer] = Some(rkey);
     }
 
-    // 14. Flush all endpoints
+    // 14. Flush all endpoints (skip self)
     let flush_param = RequestParamBuilder::new().no_imm_cmpl().build();
     for (_peer, ep) in endpoints.iter().enumerate().take(size) {
-        flush_ep_blocking(&worker, ep, &flush_param);
+        if let Some(e) = ep {
+            flush_ep_blocking(&worker, e, &flush_param);
+        }
     }
 
     // 15. Initialize UCC for collective operations (barrier, allreduce, etc.)
@@ -328,12 +324,16 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 }
 
 /// Perform an atomic XOR on a remote peer's table entry.
+///
+/// For local updates (peer == rank), this falls through to direct memory access
+/// in the main benchmark loop — callers should check `peer == rank` before calling.
 pub fn atomic_xor_remote(comm: &CommCtx, peer: usize, offset: usize, value: u64) {
     let remote_addr = comm.remote_table_addrs[peer] + (offset * std::mem::size_of::<u64>()) as u64;
     let rkey = comm.remote_rkeys[peer].as_ref().expect("rkey for peer");
+    let ep = comm.endpoints[peer].as_ref().expect("endpoint for peer");
 
     let param = RequestParamBuilder::new().build();
-    let result = comm.endpoints[peer].amo_xor64(value, remote_addr, rkey, &param);
+    let result = ep.amo_xor64(value, remote_addr, rkey, &param);
     if let Err(e) = result {
         eprintln!(
             "atomic_xor64 failed on peer {} offset {}: {:?}",
