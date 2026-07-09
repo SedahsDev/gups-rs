@@ -259,15 +259,17 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     drop(packed_addr);
 
     // 12. Create UCX endpoints to each peer (skip self — local updates go direct)
-    let endpoints: Vec<Option<ep::Ep>> = (0..size).map(|p| {
-        if p == rank {
-            None // No self-endpoint needed — local updates are direct memory access
-        } else {
-            let remote_addr = RemoteWorkerAddress::new(peer_addrs[p].clone());
-            let ep_params = ep::ParamsBuilder::new().address(&remote_addr).build();
-            Some(worker.create_ep(ep_params).expect("EP create for peer"))
-        }
-    }).collect();
+    let endpoints: Vec<Option<ep::Ep>> = (0..size)
+        .map(|p| {
+            if p == rank {
+                None // No self-endpoint needed — local updates are direct memory access
+            } else {
+                let remote_addr = RemoteWorkerAddress::new(peer_addrs[p].clone());
+                let ep_params = ep::ParamsBuilder::new().address(&remote_addr).build();
+                Some(worker.create_ep(ep_params).expect("EP create for peer"))
+            }
+        })
+        .collect();
 
     // Progress endpoint connections
     loop {
@@ -282,7 +284,8 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         if peer == rank {
             continue;
         }
-        let rkey = RemoteKey::unpack(endpoints[peer].as_ref().unwrap(), &peer_memh_data[peer]).expect("rkey unpack");
+        let rkey = RemoteKey::unpack(endpoints[peer].as_ref().unwrap(), &peer_memh_data[peer])
+            .expect("rkey unpack");
         remote_rkeys[peer] = Some(rkey);
     }
 
