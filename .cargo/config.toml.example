@@ -1,0 +1,10 @@
+# Prefer env vars over committed rpaths. Example local override:
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    # "-L", "/path/to/ucx/lib",
+    # "-L", "/path/to/ucc/lib",
+    # "-L", "/path/to/pmix/lib",
+    # "-C", "link-arg=-Wl,-rpath,/path/to/ucx/lib",
+]

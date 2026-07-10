@@ -108,8 +108,21 @@ fn run_single(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     );
 
     #[allow(clippy::erasing_op)]
-    let mut ran = starts(4 * 0);
+    let mut ran = starts(4 * 0); // single-process: rank=0, so 4*0 is correct
     let local_mask = local_table_size - 1;
+
+    // Warm-up (discarded): stabilize caches / branch predictors
+    let warmup = (proc_num_updates / 100).clamp(1, 10_000);
+    for _ in 0..warmup {
+        ran = lfsr_step(ran);
+        apply_update(&mut table, ran as u64, local_mask);
+    }
+    // Re-init table after warm-up so verification baseline stays correct
+    init_table(&mut table, 0);
+    // single-process: rank=0, so 4*0 is correct (matches C ref: starts(4*GlobalStartMyProc))
+    #[allow(clippy::erasing_op)]
+    let start_val: u64 = 4 * 0;
+    ran = starts(start_val);
 
     let start = Instant::now();
 

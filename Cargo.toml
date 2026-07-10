@@ -2,10 +2,14 @@
 name = "gups-rs"
 version = "0.1.0"
 edition = "2021"
-description = "GUPS benchmark in Rust using UCX"
+description = "GUPS (Global Update Performance) benchmark in Rust using UCX"
+license = "BSD-3-Clause"
+readme = "README.md"
+keywords = ["gups", "hpc", "benchmark", "ucx"]
+categories = ["science"]
 
 [dependencies]
 libc = "0.2"
-ucx-sys = { path = "../ucx/bindings/rust/" }
+ucx-sys = { path = "../ucx-rs" }
 pmix = { path = "../pmix-rs" }
 ucc = { path = "../ucc-rs" }

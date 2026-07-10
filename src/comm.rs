@@ -28,7 +28,6 @@ use pmix::{
 use ucc::collective::{CollectiveBuilder, UccCollectiveType, UccReductionOp};
 use ucc::context::UccContext;
 use ucc::lib_init::UccLib;
-use ucc::memory::UccMemHandle;
 use ucc::team::{UccTeam, UccTeamParams};
 
 /// Tags for inter-process control traffic (reduction, verification, etc.).
@@ -359,11 +358,9 @@ pub fn progress(comm: &CommCtx) {
 /// Uses `init_and_post` which is synchronous — blocks until the collective
 /// completes. Replaces the previous tag-message-based barrier.
 pub fn barrier(comm: &CommCtx) {
-    let stub = [0u8];
-    let mem = UccMemHandle::map_slice(&comm.ucc_context, &stub).expect("UCC barrier src map");
+    let mut stub = [0u8];
     let mut req = CollectiveBuilder::new(UccCollectiveType::Barrier)
-        .with_src(&mem)
-        .with_dst(&mem)
+        .with_inplace(&mut stub)
         .with_count(1)
         .init_and_post(&comm.ucc_team)
         .expect("UCC barrier post");
@@ -379,20 +376,13 @@ pub fn barrier(comm: &CommCtx) {
 /// completes. Replaces the previous tag-message-based reduction pattern.
 pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
     let mut buf = [value];
-    let src_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(buf.as_ptr() as *const u8, std::mem::size_of::<u64>())
-    };
-    let dst_bytes: &mut [u8] = unsafe {
+    let bytes: &mut [u8] = unsafe {
         std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, std::mem::size_of::<u64>())
     };
-    let src = UccMemHandle::map_slice(&comm.ucc_context, src_bytes).expect("UCC allreduce src map");
-    let dst =
-        UccMemHandle::map_slice_mut(&comm.ucc_context, dst_bytes).expect("UCC allreduce dst map");
     let mut req = CollectiveBuilder::new(UccCollectiveType::Allreduce)
-        .with_src(&src)
-        .with_dst(&dst)
+        .with_inplace(bytes)
         .with_count(1)
-        .with_dtype(7) // UCC_DT_UINT64
+        .with_dtype(8) // UCC_DT_UINT64 (DataType::Uint64)
         .with_reduction_op(UccReductionOp::Sum)
         .init_and_post(&comm.ucc_team)
         .expect("UCC allreduce post");

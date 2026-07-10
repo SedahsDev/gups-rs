@@ -1,21 +1,41 @@
-//! HPCC table management.
+//! Local GUPS table helpers.
 //!
-//! Each process owns a contiguous segment of the global table.
-//! Table size is a power of 2, distributed evenly across P processes (P must be power of 2).
+//! # Threading
+//!
+//! Updates are **single-threaded** by design: each process owns a contiguous
+//! table segment and applies updates only on its rank (local XOR or remote
+//! UCX atomic). Do not share a `&mut [u64]` table across threads without
+//! external synchronization. Multi-process safety is via UCX RMA atomics, not
+//! Rust `AtomicU64` on the local table.
 
-/// Initialize the local table segment.
-///
-/// `global_start` is the global index of the first element owned by this process.
-/// Each entry is initialized to its global index.
-pub fn init_table(table: &mut [u64], global_start: u64) {
-    for (i, entry) in table.iter_mut().enumerate() {
-        *entry = global_start + i as u64;
+/// Initialize the local table segment: `table[i] = i + offset`.
+pub fn init_table(table: &mut [u64], offset: u64) {
+    for (i, slot) in table.iter_mut().enumerate() {
+        *slot = i as u64 + offset;
     }
 }
 
 /// Apply a single XOR update to the local table.
-#[inline]
+///
+/// `datum` encodes both the global index stream and the XOR payload (HPCC GUPS).
 pub fn apply_update(table: &mut [u64], datum: u64, local_mask: u64) {
-    let index = (datum & local_mask) as usize;
-    table[index] ^= datum;
+    let local_idx = (datum & local_mask) as usize;
+    // Bounds: callers size the table as a power of two covering local_mask.
+    debug_assert!(local_idx < table.len());
+    table[local_idx] ^= datum;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_and_update() {
+        let mut t = vec![0u64; 8];
+        init_table(&mut t, 0);
+        assert_eq!(t[0], 0);
+        assert_eq!(t[7], 7);
+        apply_update(&mut t, 1, 7); // idx 1
+        assert_eq!(t[1], 1 ^ 1);
+    }
 }

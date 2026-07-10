@@ -1,10 +1,7 @@
+# Portable defaults only. Set native lib prefixes via env (see sibling crates):
+#   export UCX_PREFIX=... UCC_PREFIX=... PMIX_PREFIX=...
+#   export LD_LIBRARY_PATH=$UCX_PREFIX/lib:$UCC_PREFIX/lib:$PMIX_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# See .cargo/config.toml.example for optional local overrides.
+
 [target.x86_64-unknown-linux-gnu]
-rustflags = [
-    "-L", "/home/bzf/.local/ucx/lib",
-    "-L", "/home/bzf/.local/ucc/lib",
-    "-L", "/home/bzf/projects/prrte/scratch/install/lib",
-    "-C", "link-arg=-Wl,--disable-new-dtags",
-    "-C", "link-arg=-Wl,-rpath,/home/bzf/.local/ucx/lib",
-    "-C", "link-arg=-Wl,-rpath,/home/bzf/.local/ucc/lib",
-    "-C", "link-arg=-Wl,-rpath,/home/bzf/projects/prrte/scratch/install/lib",
-]
+rustflags = ["-C", "target-cpu=native"]
