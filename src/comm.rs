@@ -21,9 +21,25 @@ use ucx_sys::worker::RemoteWorkerAddress;
 use ucx_sys::RequestParamBuilder;
 
 use pmix::{
-    commit, fence, get_value, info_with_string_key, init, put_value, Context, PmixValueBuilder,
-    GLOBAL, RANK_WILDCARD,
+    commit, fence, get_value, info_with_string_key, put_value, GLOBAL, PmixClient,
+    PmixValueBuilder, RANK_WILDCARD,
 };
+
+/// Owns a live [`PmixClient`] and disconnects on drop.
+struct PmixSession(PmixClient);
+
+impl Drop for PmixSession {
+    fn drop(&mut self) {
+        let _ = self.0.disconnect(None);
+    }
+}
+
+impl std::ops::Deref for PmixSession {
+    type Target = PmixClient;
+    fn deref(&self) -> &PmixClient {
+        &self.0
+    }
+}
 
 use ucc::collective::{CollectiveBuilder, UccCollectiveType, UccReductionOp};
 use ucc::context::UccContext;
@@ -74,9 +90,9 @@ pub struct CommCtx {
     pub endpoints: Vec<Option<ep::Ep>>,
     pub worker: worker::Worker,
     context: context::Context,
-    /// PMIx context — kept alive for the lifetime of this CommCtx.
-    /// Drop calls PMIx_Finalize automatically.
-    _pmix_ctx: Context,
+    /// PMIx session — kept alive for the lifetime of this CommCtx.
+    /// Drop disconnects (PMIx_Finalize).
+    _pmix_ctx: PmixSession,
 }
 
 /// Resolve the PMIx server URI from the local URI file for standalone clients.
@@ -132,14 +148,20 @@ fn resolve_pmix_server_uri() -> Option<String> {
 /// 8. Initializes UCC library, context, and team for collective operations
 /// 9. Returns a CommCtx ready for atomic XOR operations and collectives
 pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, usize, CommCtx) {
-    // 1. Initialize PMIx — gets our rank
-    // When under prterun: init(None) lets the C library discover the server via env vars
-    // When standalone: resolve_pmix_server_uri() tries the system server URI file
+    // 1. Initialize PMIx — gets our rank.
+    // Reuse process session if a probe already connected (main.rs multiproc path).
+    // When under prterun: connect_new(None) discovers the server via env vars.
+    // When standalone: resolve_pmix_server_uri() tries the system server URI file.
     let pmix_info =
         resolve_pmix_server_uri().map(|uri| info_with_string_key("pmix.srvr.uri", &uri));
-    let pmix_ctx = init(pmix_info).expect("PMIx init");
-    let rank = pmix_ctx.get_rank() as usize;
-    let my_proc = pmix_ctx.get_proc();
+    let pmix_client = if pmix::PmixClient::new().is_live() {
+        pmix::PmixClient::new()
+    } else {
+        pmix::PmixClient::connect_new(pmix_info).expect("PMIx connect")
+    };
+    let pmix_ctx = PmixSession(pmix_client);
+    let rank = pmix_ctx.require_rank() as usize;
+    let my_proc = pmix_ctx.require_proc();
 
     // 2. Query PMIX_JOB_SIZE via wildcard proc for total process count
     // Fall back to PMIX_SIZE env var if PMIx doesn't publish it
@@ -222,7 +244,7 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 
     // 10. Commit + Fence (barrier + data exchange)
     commit().expect("PMIx_Commit");
-    fence(my_proc, None).expect("PMIx_Fence");
+    fence(&my_proc, None).expect("PMIx_Fence");
 
     // 11. Retrieve peer data via PMIx_Get
     let mut peer_addrs: Vec<Vec<u8>> = vec![Vec::new(); size];

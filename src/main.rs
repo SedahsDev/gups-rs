@@ -189,16 +189,14 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     // Even simpler: just allocate a dummy page and pass it,
     // then re-register after we know the real size.
     //
-    // Cleanest: do a minimal PMIx probe first (init + get rank/size + finalize),
-    // then allocate properly and call create_multiprocess which does its own init.
-    // PMIx allows init/finalize cycles.
-
-    // Phase 1: Quick PMIx probe to get rank/size only
-    let pmix_ctx = pmix::init(None).expect("PMIx_Init (probe)");
-    let rank = pmix_ctx.get_rank() as usize;
+    // Phase 1: Connect once to learn rank/size, then keep the process session live.
+    // create_multiprocess reuses a Live PmixClient (no second PMIx_Init — re-init
+    // after disconnect is not supported by the session state machine).
+    let pmix_probe = pmix::PmixClient::connect_new(None).expect("PMIx connect (probe)");
+    let rank = pmix_probe.require_rank() as usize;
 
     // Query pmix.job.size via wildcard proc, fall back to PMIX_SIZE env var
-    let wc_proc = pmix_ctx
+    let wc_proc = pmix_probe
         .proc_with_nspace(pmix::RANK_WILDCARD)
         .expect("wildcard_proc");
     let size = pmix::get_value(&wc_proc, pmix::JOB_SIZE, None)
@@ -210,8 +208,8 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
             process::exit(1);
         });
 
-    // Drop probe context — PMIx_Finalize allows re-init
-    drop(pmix_ctx);
+    // Drop the probe *handle* only — do not disconnect; session stays Live for CommCtx.
+    drop(pmix_probe);
 
     if size == 1 {
         eprintln!("PMIX_JOB_SIZE is 1 — nothing to do in multi-process mode.");
