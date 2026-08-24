@@ -10,30 +10,42 @@
 ///
 /// UCC is used for collective operations (barrier, allreduce) replacing the
 /// previous tag-message-based barrier and verification reduction.
+#[cfg(feature = "ucc")]
 use std::ffi::CString;
 
+#[cfg(feature = "ucc")]
 use ucx_sys::RequestParamBuilder;
+#[cfg(feature = "ucc")]
 use ucx_sys::context;
+#[cfg(feature = "ucc")]
 use ucx_sys::ep;
+#[cfg(feature = "ucc")]
 use ucx_sys::memh;
+#[cfg(feature = "ucc")]
 use ucx_sys::rma::RemoteKey;
+#[cfg(feature = "ucc")]
 use ucx_sys::worker;
+#[cfg(feature = "ucc")]
 use ucx_sys::worker::RemoteWorkerAddress;
 
+#[cfg(feature = "ucc")]
 use pmix::{
     GLOBAL, PmixClient, PmixValueBuilder, RANK_WILDCARD, commit, fence, get_value,
     info_with_string_key, put_value,
 };
 
 /// Owns a live [`PmixClient`] and disconnects on drop.
+#[cfg(feature = "ucc")]
 struct PmixSession(PmixClient);
 
+#[cfg(feature = "ucc")]
 impl Drop for PmixSession {
     fn drop(&mut self) {
         let _ = self.0.disconnect(None);
     }
 }
 
+#[cfg(feature = "ucc")]
 impl std::ops::Deref for PmixSession {
     type Target = PmixClient;
     fn deref(&self) -> &PmixClient {
@@ -41,9 +53,13 @@ impl std::ops::Deref for PmixSession {
     }
 }
 
+#[cfg(feature = "ucc")]
 use ucc::collective::{CollectiveBuilder, UccCollectiveType, UccReductionOp};
+#[cfg(feature = "ucc")]
 use ucc::context::UccContext;
+#[cfg(feature = "ucc")]
 use ucc::lib_init::UccLib;
+#[cfg(feature = "ucc")]
 use ucc::team::{UccTeam, UccTeamParams};
 
 /// Tags for inter-process control traffic (reduction, verification, etc.).
@@ -54,8 +70,11 @@ pub const TAG_SYNC: u64 = 0x3000;
 pub const TAG_VERIFY: u64 = 0x4000;
 
 // PMIx key names for data exchange (null-terminated C strings)
+#[cfg(feature = "ucc")]
 const PMIX_KEY_UCX_ADDR: &str = "gups.ucx.addr";
+#[cfg(feature = "ucc")]
 const PMIX_KEY_UCX_MEMH: &str = "gups.ucx.memh";
+#[cfg(feature = "ucc")]
 const PMIX_KEY_UCX_TABLE_ADDR: &str = "gups.ucx.table_addr";
 
 /// Single-node communication (no UCX/PMIx needed).
@@ -74,14 +93,18 @@ pub fn allreduce_u64_single(_comm: &UpdateComm, value: u64) -> u64 {
 /// Multi-process communication context using UCX RMA atomics + PMIx bootstrap.
 /// UCC is used for collective operations (barrier, allreduce).
 #[allow(dead_code)]
+#[cfg(feature = "ucc")]
 pub struct CommCtx {
     pub rank: usize,
     pub size: usize,
     /// UCC team for collective operations (barrier, allreduce, etc.).
+    #[cfg(feature = "ucc")]
     ucc_team: UccTeam,
     /// UCC context for collective operations.
+    #[cfg(feature = "ucc")]
     ucc_context: UccContext,
     /// UCC library handle for collective operations.
+    #[cfg(feature = "ucc")]
     ucc_lib: UccLib,
     remote_rkeys: Vec<Option<RemoteKey>>,
     remote_table_addrs: Vec<u64>,
@@ -109,6 +132,7 @@ pub struct CommCtx {
 /// system server daemon is running. This avoids connecting to stale daemons.
 ///
 /// Lookup: URI file at `/run/user/{uid}/prte/uri`
+#[cfg(feature = "ucc")]
 fn resolve_pmix_server_uri() -> Option<String> {
     // When running under prterun, let PMIx_Init discover the server via env vars.
     // Do NOT pass pmix.srvr.uri to PMIx_Init — that key is for PMIx_Tool_Init,
@@ -147,6 +171,7 @@ fn resolve_pmix_server_uri() -> Option<String> {
 /// 7. Creates UCX endpoints and unpacks remote rkeys
 /// 8. Initializes UCC library, context, and team for collective operations
 /// 9. Returns a CommCtx ready for atomic XOR operations and collectives
+#[cfg(feature = "ucc")]
 pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, usize, CommCtx) {
     // 1. Initialize PMIx — gets our rank.
     // Reuse process session if a probe already connected (main.rs multiproc path).
@@ -319,16 +344,20 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     }
 
     // 15. Initialize UCC for collective operations (barrier, allreduce, etc.)
-    let ucc_lib = UccLib::init().expect("UCC library init");
-    let ucc_context = UccContext::new(ucc_lib.clone()).expect("UCC context create");
+    #[cfg(feature = "ucc")]
+    let (ucc_lib, ucc_context, ucc_team) = {
+        let ucc_lib = UccLib::init().expect("UCC library init");
+        let ucc_context = UccContext::new(ucc_lib.clone()).expect("UCC context create");
 
-    // Create UCC team with explicit size
-    let mut ucc_team_params = UccTeamParams::default();
-    ucc_team_params.with_team_size(size as u64);
-    let ucc_team =
-        UccTeam::with_params(ucc_context.clone(), ucc_team_params).expect("UCC team create");
+        // Create UCC team with explicit size
+        let mut ucc_team_params = UccTeamParams::default();
+        ucc_team_params.with_team_size(size as u64);
+        let ucc_team =
+            UccTeam::with_params(ucc_context.clone(), ucc_team_params).expect("UCC team create");
 
-    eprintln!("[gups-rs] UCC team created (rank={}, size={})", rank, size);
+        eprintln!("[gups-rs] UCC team created (rank={}, size={})", rank, size);
+        (ucc_lib, ucc_context, ucc_team)
+    };
 
     let ctx = CommCtx {
         rank,
@@ -340,8 +369,11 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         remote_table_addrs,
         _memh: memh,
         _pmix_ctx: pmix_ctx,
+        #[cfg(feature = "ucc")]
         ucc_lib,
+        #[cfg(feature = "ucc")]
         ucc_context,
+        #[cfg(feature = "ucc")]
         ucc_team,
     };
     (rank, size, ctx)
@@ -351,6 +383,7 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 ///
 /// For local updates (peer == rank), this falls through to direct memory access
 /// in the main benchmark loop — callers should check `peer == rank` before calling.
+#[cfg(feature = "ucc")]
 pub fn atomic_xor_remote(comm: &CommCtx, peer: usize, offset: usize, value: u64) {
     let remote_addr = comm.remote_table_addrs[peer] + (offset * std::mem::size_of::<u64>()) as u64;
     let rkey = comm.remote_rkeys[peer].as_ref().expect("rkey for peer");
@@ -367,6 +400,7 @@ pub fn atomic_xor_remote(comm: &CommCtx, peer: usize, offset: usize, value: u64)
 }
 
 /// Progress the UCX worker.
+#[cfg(feature = "ucc")]
 pub fn progress(comm: &CommCtx) {
     loop {
         if !comm.worker.progress() {
@@ -379,6 +413,7 @@ pub fn progress(comm: &CommCtx) {
 ///
 /// Uses `init_and_post` which is synchronous — blocks until the collective
 /// completes. Replaces the previous tag-message-based barrier.
+#[cfg(feature = "ucc")]
 pub fn barrier(comm: &CommCtx) {
     let mut stub = [0u8];
     let mut req = CollectiveBuilder::new(UccCollectiveType::Barrier)
@@ -396,6 +431,7 @@ pub fn barrier(comm: &CommCtx) {
 ///
 /// Uses `init_and_post` which is synchronous — blocks until the collective
 /// completes. Replaces the previous tag-message-based reduction pattern.
+#[cfg(feature = "ucc")]
 pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
     let mut buf = [value];
     let bytes: &mut [u8] = unsafe {
@@ -414,6 +450,7 @@ pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
 
 // ── Internal helpers ──
 
+#[cfg(feature = "ucc")]
 fn flush_ep_blocking(worker: &worker::Worker, ep: &ep::Ep, param: &ucx_sys::RequestParam) {
     // Flush via the endpoint by flushing the worker — UCX flush is worker-wide
     // but we call it once per endpoint to be safe in the original pattern.
@@ -503,6 +540,7 @@ mod tests {
 
     /// PMIx key constants are correct and distinct.
     #[test]
+    #[cfg(feature = "ucc")]
     fn test_pmix_key_constants() {
         assert_eq!(PMIX_KEY_UCX_ADDR, "gups.ucx.addr");
         assert_eq!(PMIX_KEY_UCX_MEMH, "gups.ucx.memh");
@@ -516,6 +554,7 @@ mod tests {
     /// #[ignore] — requires PMIx daemon (prrte) to be running.
     #[test]
     #[ignore = "requires PMIx daemon (prrte) for multi-process bootstrap"]
+    #[cfg(feature = "ucc")]
     fn test_create_multiprocess() {
         let table: Vec<u64> = vec![0; 1024];
         let table_ptr = table.as_ptr() as *mut u64;
@@ -537,6 +576,7 @@ mod tests {
     /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
     #[test]
     #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    #[cfg(feature = "ucc")]
     fn test_atomic_xor_remote() {
         let table: Vec<u64> = vec![0; 1024];
         let table_ptr = table.as_ptr() as *mut u64;
@@ -556,6 +596,7 @@ mod tests {
     /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
     #[test]
     #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    #[cfg(feature = "ucc")]
     fn test_barrier_multiprocess() {
         let table: Vec<u64> = vec![0; 1024];
         let table_ptr = table.as_ptr() as *mut u64;
@@ -572,6 +613,7 @@ mod tests {
     /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
     #[test]
     #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    #[cfg(feature = "ucc")]
     fn test_allreduce_u64_multiprocess() {
         let table: Vec<u64> = vec![0; 1024];
         let table_ptr = table.as_ptr() as *mut u64;
@@ -594,6 +636,7 @@ mod tests {
     /// #[ignore] — requires PMIx daemon (prrte) for multi-process setup.
     #[test]
     #[ignore = "requires PMIx daemon (prrte) for multi-process setup"]
+    #[cfg(feature = "ucc")]
     fn test_commctx_array_sizes() {
         let table: Vec<u64> = vec![0; 1024];
         let table_ptr = table.as_ptr() as *mut u64;

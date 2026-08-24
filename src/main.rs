@@ -27,6 +27,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
+#[cfg(feature = "ucc")]
 use comm::{allreduce_u64, atomic_xor_remote, barrier, create_multiprocess, progress};
 use rng::{lfsr_step, starts};
 use table::{apply_update, init_table};
@@ -39,6 +40,7 @@ fn print_usage() {
     eprintln!("  -h, --help               Show help");
 }
 
+#[cfg(feature = "ucc")]
 fn is_power_of_two(n: u64) -> bool {
     n > 0 && (n & (n - 1)) == 0
 }
@@ -176,6 +178,15 @@ fn run_single(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
 /// Multi-process mode: uses UCX RMA atomics for direct remote table updates.
 /// Rank and size are obtained from PMIx internally by create_multiprocess().
+#[cfg(not(feature = "ucc"))]
+fn run_multi(_table_size_log: Option<u64>, _num_updates_arg: Option<u64>) {
+    eprintln!(
+        "Multi-process mode requires the 'ucc' feature. Rebuild with --features ucc (or default features)."
+    );
+    process::exit(1);
+}
+
+#[cfg(feature = "ucc")]
 fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     // create_multiprocess() handles PMIx init, rank/size discovery, UCX setup,
     // and rkey exchange. It returns (rank, size, CommCtx).

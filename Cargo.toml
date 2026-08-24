@@ -12,4 +12,11 @@ categories = ["science"]
 libc = "0.2"
 ucx-sys = { path = "../ucx-rs" }
 pmix = { path = "../pmix-rs" }
-ucc = { path = "../ucc-rs" }
+
+[features]
+default = ["ucc"]
+ucc = ["dep:ucc"]
+
+[dependencies.ucc]
+path = "../ucc-rs"
+optional = true
