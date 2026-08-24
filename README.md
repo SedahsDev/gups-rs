@@ -24,7 +24,7 @@ export LD_LIBRARY_PATH=$PMIX_PREFIX/lib:$UCX_PREFIX/lib:$UCC_PREFIX/lib${LD_LIBR
 cargo build --release
 ```
 
-See the Build section above for build prerequisites and commands.
+See the [Build](#build) section above for build prerequisites and commands.
 
 ## Usage
 
