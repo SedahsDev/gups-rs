@@ -1,7 +1,7 @@
 [package]
 name = "gups-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "GUPS (Global Update Performance) benchmark in Rust using UCX"
 license = "BSD-3-Clause"
 readme = "README.md"
