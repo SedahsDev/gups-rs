@@ -21,8 +21,8 @@ use ucx_sys::worker::RemoteWorkerAddress;
 use ucx_sys::RequestParamBuilder;
 
 use pmix::{
-    commit, fence, get_value, info_with_string_key, put_value, GLOBAL, PmixClient,
-    PmixValueBuilder, RANK_WILDCARD,
+    commit, fence, get_value, info_with_string_key, put_value, PmixClient, PmixValueBuilder,
+    GLOBAL, RANK_WILDCARD,
 };
 
 /// Owns a live [`PmixClient`] and disconnects on drop.
@@ -153,7 +153,7 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     // When under prterun: connect_new(None) discovers the server via env vars.
     // When standalone: resolve_pmix_server_uri() tries the system server URI file.
     let pmix_info =
-        resolve_pmix_server_uri().map(|uri| info_with_string_key("pmix.srvr.uri", &uri));
+        resolve_pmix_server_uri().and_then(|uri| info_with_string_key("pmix.srvr.uri", &uri).ok());
     let pmix_client = if pmix::PmixClient::new().is_live() {
         pmix::PmixClient::new()
     } else {
@@ -186,8 +186,8 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         .estimated_num_eps(size - 1)
         .estimated_num_ppn(2)
         .build();
-    let config = context::Config::default();
-    let uctx = context::Context::new(&config, &ctx_params).expect("UCX context init");
+    let config = context::Config::read("", "").expect("UCX config read");
+    let mut uctx = context::Context::new(&config, &ctx_params).expect("UCX context init");
     drop(config);
 
     // 4. Create worker
