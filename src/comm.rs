@@ -12,17 +12,17 @@
 /// previous tag-message-based barrier and verification reduction.
 use std::ffi::CString;
 
+use ucx_sys::RequestParamBuilder;
 use ucx_sys::context;
 use ucx_sys::ep;
 use ucx_sys::memh;
 use ucx_sys::rma::RemoteKey;
 use ucx_sys::worker;
 use ucx_sys::worker::RemoteWorkerAddress;
-use ucx_sys::RequestParamBuilder;
 
 use pmix::{
-    commit, fence, get_value, info_with_string_key, put_value, PmixClient, PmixValueBuilder,
-    GLOBAL, RANK_WILDCARD,
+    GLOBAL, PmixClient, PmixValueBuilder, RANK_WILDCARD, commit, fence, get_value,
+    info_with_string_key, put_value,
 };
 
 /// Owns a live [`PmixClient`] and disconnects on drop.
@@ -495,8 +495,8 @@ mod tests {
         assert_eq!(TAG_SYNC, 0x3000);
         assert_eq!(TAG_VERIFY, 0x4000);
         assert_ne!(TAG_SYNC, TAG_VERIFY);
-        assert!(TAG_SYNC > 0);
-        assert!(TAG_VERIFY > 0);
+        assert_ne!(TAG_SYNC, 0);
+        assert_ne!(TAG_VERIFY, 0);
     }
 
     // ── PMIx key constant tests ──
