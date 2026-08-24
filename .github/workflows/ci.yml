@@ -8,33 +8,102 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # All four repositories are checked out below workflow/, making these paths
+  # siblings as required by gups-rs/Cargo.toml.
+  PMIX_PREFIX: ${{ github.workspace }}/pmix-install
+  UCX_PREFIX: /usr
+  UCC_PREFIX: ${{ github.workspace }}/ucc-install
+  LD_LIBRARY_PATH: ${{ github.workspace }}/pmix-install/lib:${{ github.workspace }}/pmix-install/lib64:${{ github.workspace }}/ucc-install/lib:/usr/lib/x86_64-linux-gnu:/usr/lib
 
 jobs:
-  tier0:
-    name: Tier 0 (check / unit tests)
+  build-and-test:
+    name: Build, test, lint, and format
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      # The path must be one level below a common parent. From workflow/gups-rs,
+      # ../ucx-rs, ../pmix-rs, and ../ucc-rs then resolve to these checkouts.
+      - name: Check out gups-rs
+        uses: actions/checkout@v4
         with:
-          # Path deps need sibling checkouts in a real monorepo publish.
-          # For multi-repo CI, use repository_dispatch or composite checkout of pmix/ucx/ucc.
-          path: gups-rs
+          repository: SedahsDev/gups-rs
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: workflow/gups-rs
 
-      - name: Note path dependencies
+      - name: Check out ucx-rs
+        uses: actions/checkout@v4
+        with:
+          repository: SedahsDev/ucx-rs
+          ref: main
+          path: workflow/ucx-rs
+
+      - name: Check out pmix-rs
+        uses: actions/checkout@v4
+        with:
+          repository: SedahsDev/pmix-rs
+          ref: main
+          path: workflow/pmix-rs
+
+      - name: Check out ucc-rs
+        uses: actions/checkout@v4
+        with:
+          repository: SedahsDev/ucc-rs
+          ref: main
+          path: workflow/ucc-rs
+
+      - name: Install native build dependencies
         run: |
-          echo "gups-rs depends on path crates ../ucx-rs ../pmix-rs ../ucc-rs"
-          echo "This workflow expects a workspace layout or additional checkouts."
-          echo "Local Tier 0: cargo test / cargo check with those trees present."
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes \
+            autoconf automake build-essential clang libclang-dev libevent-dev \
+            libhwloc-dev libnuma-dev libtool pkg-config libucx-dev
+
+      - name: Build OpenPMIx 6.1.0
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v6.1.0 https://github.com/openpmix/openpmix.git openpmix
+          cd openpmix
+          ./configure --prefix="$PMIX_PREFIX"
+          make -j"$(nproc)"
+          make install
+          test -f "$PMIX_PREFIX/include/pmix.h"
+          test -f "$PMIX_PREFIX/lib/libpmix.so" || test -f "$PMIX_PREFIX/lib64/libpmix.so"
+
+      - name: Build UCC 1.4.4
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v1.4.4 https://github.com/openucx/ucc.git ucc
+          cd ucc
+          ./configure --prefix="$UCC_PREFIX" --with-ucx="$UCX_PREFIX"
+          make -j"$(nproc)"
+          make install
+          test -f "$UCC_PREFIX/include/ucc/api/ucc.h" || test -f "$UCC_PREFIX/include/ucc.h"
+          test -f "$UCC_PREFIX/lib/libucc.so"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      # When run from monorepo mirror with all crates present:
-      - name: Unit tests (monorepo layout)
-        if: hashFiles('../ucx-rs/Cargo.toml') != '' || hashFiles('ucx-rs/Cargo.toml') != ''
-        working-directory: gups-rs
-        run: |
-          cargo test --lib || cargo test
-        continue-on-error: true
+      - name: Cargo check all targets
+        working-directory: workflow/gups-rs
+        run: cargo check --all-targets
+
+      - name: Unit tests
+        working-directory: workflow/gups-rs
+        run: cargo test --lib
+
+      - name: Clippy
+        working-directory: workflow/gups-rs
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustfmt
+        working-directory: workflow/gups-rs
+        run: cargo fmt -- --check
+
+      # The ignored multi-process tests require RDMA hardware and a PRRTE
+      # daemon, so cargo test --lib intentionally exercises only single-node tests.
+      # Native-library installation is deliberately a hard prerequisite: failures
+      # above must stop the job, and no quality gate is conditionally skipped.
