@@ -24,6 +24,9 @@ export LD_LIBRARY_PATH=$PMIX_PREFIX/lib:$UCX_PREFIX/lib:$UCC_PREFIX/lib${LD_LIBR
 cargo build --release
 ```
 
+UCC is an optional feature enabled by default. For single-process mode without
+ a UCC installation, build with `cargo build --no-default-features`.
+
 See the [Build](#build) section above for build prerequisites and commands.
 
 ## Usage
