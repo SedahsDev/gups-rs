@@ -10,12 +10,15 @@ categories = ["science"]
 
 [dependencies]
 libc = "0.2"
+# OpenSHMEM owns lifecycle and collectives; direct bindings remain only for the
+# external Vec<u64> table fallback documented in comm.rs.
+openshmem = { path = "../openshmem-rs" }
 ucx-sys = { path = "../ucx-rs" }
 pmix = { path = "../pmix-rs" }
 
 [features]
 default = ["ucc"]
-ucc = ["dep:ucc"]
+ucc = ["dep:ucc", "openshmem/collectives"]
 
 [dependencies.ucc]
 path = "../ucc-rs"

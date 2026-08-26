@@ -1,8 +1,10 @@
 # gups-rs
 
-Rust port of the **GUPS** (Giga Updates Per Second / Global Update Performance) benchmark, using **UCX** for multi-process RMA atomics and **PMIx** for process management.
+Rust port of the **GUPS** (Giga Updates Per Second / Global Update Performance) benchmark, consuming the `openshmem` layer for process lifecycle and collectives.
 
-Depends on path crates: `../ucx-rs`, `../pmix-rs`, `../ucc-rs`.
+Depends on `../openshmem-rs`; that layer owns the UCX, PMIx, and optional UCC
+bindings. The benchmark retains direct bindings only for the application-owned
+table fallback documented in `src/comm.rs`.
 
 ## Modes
 
@@ -52,7 +54,7 @@ prterun -np 2 ./target/release/gups-rs -t 24
 - `src/main.rs` — CLI + orchestration
 - `src/rng.rs` — LFSR
 - `src/table.rs` — table + updates
-- `src/comm.rs` — multi-process UCX path
+- `src/comm.rs` — OpenSHMEM collective adapter and minimal direct-table fallback
 - `src/verify.rs` — verification
 
 ## License
