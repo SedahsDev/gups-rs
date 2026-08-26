@@ -176,8 +176,8 @@ fn run_single(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     );
 }
 
-/// Multi-process mode: uses UCX RMA atomics for direct remote table updates.
-/// Rank and size are obtained from PMIx internally by create_multiprocess().
+/// Multi-process mode: uses OpenSHMEM for lifecycle and collectives, with the
+/// direct-table compatibility path for the current application-owned Vec.
 #[cfg(not(feature = "ucc"))]
 fn run_multi(_table_size_log: Option<u64>, _num_updates_arg: Option<u64>) {
     eprintln!(
@@ -200,30 +200,20 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     // Even simpler: just allocate a dummy page and pass it,
     // then re-register after we know the real size.
     //
-    // Phase 1: Connect once to learn rank/size, then keep the process session live.
-    // create_multiprocess reuses a Live PmixClient (no second PMIx_Init — re-init
-    // after disconnect is not supported by the session state machine).
-    let pmix_probe = pmix::PmixClient::connect_new(None).expect("PMIx connect (probe)");
-    let rank = pmix_probe.require_rank() as usize;
+    // OpenSHMEM owns the process lifecycle and collective runtime. The direct
+    // communication adapter below is retained only for the application-owned
+    // Vec<u64> table, which the current layer cannot register.
+    if let Err(error) = openshmem::init::init() {
+        eprintln!("OpenSHMEM initialization failed: {error:?}");
+        process::exit(1);
+    }
 
-    // Query pmix.job.size via wildcard proc, fall back to PMIX_SIZE env var
-    let wc_proc = pmix_probe
-        .proc_with_nspace(pmix::RANK_WILDCARD)
-        .expect("wildcard_proc");
-    let size = pmix::get_value(&wc_proc, pmix::JOB_SIZE, None)
-        .ok()
-        .map(|v| v.uint32() as usize)
-        .or_else(|| env::var("PMIX_SIZE").ok().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| {
-            eprintln!("Cannot determine job size from PMIx (pmix.job.size) or PMIX_SIZE env var.");
-            process::exit(1);
-        });
-
-    // Drop the probe *handle* only — do not disconnect; session stays Live for CommCtx.
-    drop(pmix_probe);
+    // Learn rank and size through OpenSHMEM rather than PMIx directly.
+    let rank = openshmem::init::my_pe().expect("OpenSHMEM rank") as usize;
+    let size = openshmem::init::n_pes().expect("OpenSHMEM size");
 
     if size == 1 {
-        eprintln!("PMIX_JOB_SIZE is 1 — nothing to do in multi-process mode.");
+        eprintln!("OpenSHMEM job size is 1 — nothing to do in multi-process mode.");
         process::exit(1);
     }
 
@@ -270,7 +260,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         );
     }
 
-    // Phase 2: Full UCX + PMIx communication setup (re-init PMIx)
+    // Phase 2: direct-UCX compatibility setup for the application-owned table
     let table_bytes = local_table_size as usize * std::mem::size_of::<u64>();
     let (_rank, _size, comm_ctx) = create_multiprocess(table.as_mut_ptr(), table_bytes);
 
@@ -343,7 +333,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     );
     let verify_elapsed = Instant::now().duration_since(verify_start).as_secs_f64();
 
-    // Collect total errors via UCC allreduce (SUM reduction)
+    // Collect total errors via the OpenSHMEM allreduce adapter (SUM reduction).
     let total_errors: u64 = allreduce_u64(&comm_ctx, errors);
 
     barrier(&comm_ctx);

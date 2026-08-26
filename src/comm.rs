@@ -1,4 +1,4 @@
-/// UCX communication layer for the GUPS benchmark.
+/// OpenSHMEM communication adapter for the GUPS benchmark.
 ///
 /// Uses RMA (Remote Memory Access) with atomic XOR operations for direct
 /// remote table updates. Pattern derived from osss-ucx:
@@ -53,17 +53,7 @@ impl std::ops::Deref for PmixSession {
     }
 }
 
-#[cfg(feature = "ucc")]
-use ucc::collective::{CollectiveBuilder, UccCollectiveType, UccReductionOp};
-#[cfg(feature = "ucc")]
-use ucc::context::UccContext;
-#[cfg(feature = "ucc")]
-use ucc::lib_init::UccLib;
-#[cfg(feature = "ucc")]
-use ucc::team::{UccTeam, UccTeamParams};
-
-/// Tags for inter-process control traffic (reduction, verification, etc.).
-/// Kept for backward compatibility; barrier and allreduce now use UCC.
+/// Legacy tags retained for public compatibility; collectives use OpenSHMEM.
 #[allow(dead_code)]
 pub const TAG_SYNC: u64 = 0x3000;
 #[allow(dead_code)]
@@ -97,15 +87,7 @@ pub fn allreduce_u64_single(_comm: &UpdateComm, value: u64) -> u64 {
 pub struct CommCtx {
     pub rank: usize,
     pub size: usize,
-    /// UCC team for collective operations (barrier, allreduce, etc.).
-    #[cfg(feature = "ucc")]
-    ucc_team: UccTeam,
-    /// UCC context for collective operations.
-    #[cfg(feature = "ucc")]
-    ucc_context: UccContext,
-    /// UCC library handle for collective operations.
-    #[cfg(feature = "ucc")]
-    ucc_lib: UccLib,
+
     remote_rkeys: Vec<Option<RemoteKey>>,
     remote_table_addrs: Vec<u64>,
     _memh: memh::MemHandle,
@@ -343,22 +325,6 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         }
     }
 
-    // 15. Initialize UCC for collective operations (barrier, allreduce, etc.)
-    #[cfg(feature = "ucc")]
-    let (ucc_lib, ucc_context, ucc_team) = {
-        let ucc_lib = UccLib::init().expect("UCC library init");
-        let ucc_context = UccContext::new(ucc_lib.clone()).expect("UCC context create");
-
-        // Create UCC team with explicit size
-        let mut ucc_team_params = UccTeamParams::default();
-        ucc_team_params.with_team_size(size as u64);
-        let ucc_team =
-            UccTeam::with_params(ucc_context.clone(), ucc_team_params).expect("UCC team create");
-
-        eprintln!("[gups-rs] UCC team created (rank={}, size={})", rank, size);
-        (ucc_lib, ucc_context, ucc_team)
-    };
-
     let ctx = CommCtx {
         rank,
         size,
@@ -369,12 +335,6 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
         remote_table_addrs,
         _memh: memh,
         _pmix_ctx: pmix_ctx,
-        #[cfg(feature = "ucc")]
-        ucc_lib,
-        #[cfg(feature = "ucc")]
-        ucc_context,
-        #[cfg(feature = "ucc")]
-        ucc_team,
     };
     (rank, size, ctx)
 }
@@ -415,13 +375,8 @@ pub fn progress(comm: &CommCtx) {
 /// completes. Replaces the previous tag-message-based barrier.
 #[cfg(feature = "ucc")]
 pub fn barrier(comm: &CommCtx) {
-    let mut stub = [0u8];
-    let mut req = CollectiveBuilder::new(UccCollectiveType::Barrier)
-        .with_inplace(&mut stub)
-        .with_count(1)
-        .init_and_post(&comm.ucc_team)
-        .expect("UCC barrier post");
-    let _ = req.finalize();
+    let _ = comm;
+    openshmem::coll::barrier().expect("OpenSHMEM barrier");
 }
 
 /// Allreduce a u64 value across all processes using UCC collective allreduce.
@@ -433,19 +388,11 @@ pub fn barrier(comm: &CommCtx) {
 /// completes. Replaces the previous tag-message-based reduction pattern.
 #[cfg(feature = "ucc")]
 pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
-    let mut buf = [value];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, std::mem::size_of::<u64>())
-    };
-    let mut req = CollectiveBuilder::new(UccCollectiveType::Allreduce)
-        .with_inplace(bytes)
-        .with_count(1)
-        .with_dtype(8) // UCC_DT_UINT64 (DataType::Uint64)
-        .with_reduction_op(UccReductionOp::Sum)
-        .init_and_post(&comm.ucc_team)
-        .expect("UCC allreduce post");
-    let _ = req.finalize();
-    buf[0]
+    let _ = comm;
+    let mut values = [value];
+    openshmem::coll::reduce(ucc::collective::UccReductionOp::Sum, &mut values)
+        .expect("OpenSHMEM allreduce");
+    values[0]
 }
 
 // ── Internal helpers ──
