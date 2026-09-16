@@ -5,8 +5,7 @@
 /// - Memory registration -> rkey packing -> PMIx Put/Commit/Fence/Get exchange
 /// - Direct `atomic_xor64` on remote table addresses (no message passing per update)
 ///
-/// Single-node mode: No UCX/PMIx needed; operates on local memory directly.
-/// Multi-process mode: Full UCX stack with RMA atomics, PMIx for bootstrap.
+/// Multi-process only: full UCX stack with RMA atomics, PMIx for bootstrap.
 ///
 /// UCC is used for collective operations (barrier, allreduce) replacing the
 /// previous tag-message-based barrier and verification reduction.
@@ -57,19 +56,6 @@ pub const TAG_VERIFY: u64 = 0x4000;
 const PMIX_KEY_UCX_ADDR: &str = "gups.ucx.addr";
 const PMIX_KEY_UCX_MEMH: &str = "gups.ucx.memh";
 const PMIX_KEY_UCX_TABLE_ADDR: &str = "gups.ucx.table_addr";
-
-/// Single-node communication (no UCX/PMIx needed).
-#[allow(dead_code)]
-pub struct UpdateComm {
-    pub rank: usize,
-    pub size: usize,
-}
-
-/// Allreduce for single-node mode (returns the local value unchanged).
-#[allow(dead_code)]
-pub fn allreduce_u64_single(_comm: &UpdateComm, value: u64) -> u64 {
-    value
-}
 
 /// Multi-process communication context using UCX RMA atomics + PMIx bootstrap.
 /// UCC is used for collective operations (barrier, allreduce).
@@ -433,60 +419,6 @@ fn flush_ep_blocking(worker: &worker::Worker, ep: &ep::Ep, param: &ucx_sys::Requ
 mod tests {
     use super::*;
 
-    // ── Single-node (UpdateComm) tests ──
-
-    /// UpdateComm can be constructed with arbitrary rank/size values.
-    #[test]
-    fn test_update_comm_creation() {
-        let comm = UpdateComm { rank: 0, size: 1 };
-        assert_eq!(comm.rank, 0);
-        assert_eq!(comm.size, 1);
-    }
-
-    /// UpdateComm with non-zero rank.
-    #[test]
-    fn test_update_comm_nonzero_rank() {
-        let comm = UpdateComm {
-            rank: 42,
-            size: 128,
-        };
-        assert_eq!(comm.rank, 42);
-        assert_eq!(comm.size, 128);
-    }
-
-    // ── Single-node allreduce tests ──
-
-    /// Single-node allreduce returns the input value unchanged.
-    #[test]
-    fn test_allreduce_u64_single_identity() {
-        let comm = UpdateComm { rank: 0, size: 1 };
-        assert_eq!(allreduce_u64_single(&comm, 42), 42);
-    }
-
-    /// Single-node allreduce with zero.
-    #[test]
-    fn test_allreduce_u64_single_zero() {
-        let comm = UpdateComm { rank: 0, size: 1 };
-        assert_eq!(allreduce_u64_single(&comm, 0), 0);
-    }
-
-    /// Single-node allreduce with max u64.
-    #[test]
-    fn test_allreduce_u64_single_max() {
-        let comm = UpdateComm { rank: 0, size: 1 };
-        assert_eq!(allreduce_u64_single(&comm, u64::MAX), u64::MAX);
-    }
-
-    /// Single-node allreduce ignores comm fields (rank/size don't matter).
-    #[test]
-    fn test_allreduce_u64_single_ignores_comm() {
-        let comm = UpdateComm {
-            rank: 99,
-            size: 256,
-        };
-        assert_eq!(allreduce_u64_single(&comm, 12345), 12345);
-    }
-
     // ── Tag constant tests ──
 
     /// TAG_SYNC and TAG_VERIFY have distinct, non-zero values.
@@ -547,8 +479,8 @@ mod tests {
         // XOR with self (peer == rank) — should work since self EP exists
         atomic_xor_remote(&ctx, ctx.rank, 0, 0xDEADBEEF);
         progress(&ctx);
-        // In single-process mode, the self-XOR should be visible locally
-        // (this verifies the atomic operation path compiles and runs)
+        // XOR against ourselves exercises the same remote-atomic path a peer
+        // would use, without needing a second process to observe it.
     }
 
     /// barrier() completes without panic using UCC collective.
