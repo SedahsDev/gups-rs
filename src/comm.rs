@@ -63,6 +63,8 @@ const PMIX_KEY_UCX_TABLE_ADDR: &str = "gups.ucx.table_addr";
 pub struct CommCtx {
     pub rank: usize,
     pub size: usize,
+    /// Pointer to the UCX-allocated shared table segment (UCP_MEM_MAP_ALLOCATE).
+    pub table_ptr: *mut u64,
     /// UCC team for collective operations (barrier, allreduce, etc.).
     ucc_team: UccTeam,
     /// UCC context for collective operations.
@@ -180,16 +182,23 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     let wparams = worker::ParamsBuilder::new().build();
     let worker = uctx.worker_create(&wparams).expect("UCX worker create");
 
-    // 5. Pack own worker address
-    let packed_addr = worker.pack_address().expect("Worker address pack");
-    let own_addr_bytes = packed_addr.to_vec();
-
-    // 6. Register table memory with UCX
+    // 5. Register table memory with UCX FIRST so the worker address advertises
+    // the shared-memory (sysv/posix) transport for RMA atomics.
+    // Use UCP_MEM_MAP_ALLOCATE so UCX allocates the table in a shared segment
+    // that peer processes can access via RMA atomics. Passing a heap Vec
+    // pointer here would only register private heap memory, which sysv/posix
+    // transports cannot reach cross-process (UCS_ERR_UNREACHABLE).
     let mut mem_params = memh::MemMapParamsBuilder::new();
     mem_params
-        .address(table_base as *mut std::os::raw::c_void)
-        .length(table_bytes);
+        .address(std::ptr::null_mut()) // ALLOCATE: UCX allocates; address must be null
+        .length(table_bytes)
+        .flags(2 | 8); // UCP_MEM_MAP_ALLOCATE | UCP_MEM_MAP_SYMMETRIC_RKEY
     let memh = memh::MemHandle::map(&uctx, &mut mem_params).expect("Memory registration");
+    eprintln!("[gups-rs] mem_map OK, addr={:p}", memh.query().expect("q").address());
+
+    // 6. Pack own worker address (now advertises the sm transport)
+    let packed_addr = worker.pack_address().expect("Worker address pack");
+    let own_addr_bytes = packed_addr.to_vec();
 
     // 7. Pack rkey for our memory using legacy ucp_rkey_pack
     // (works on all memory domains including self/sysv/posix)
@@ -316,9 +325,11 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 
     eprintln!("[gups-rs] UCC team created (rank={}, size={})", rank, size);
 
+    let table_ptr = memh.query().expect("Memh query").address() as *mut u64;
     let ctx = CommCtx {
         rank,
         size,
+        table_ptr,
         context: uctx,
         worker,
         endpoints,

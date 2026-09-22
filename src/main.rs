@@ -146,9 +146,15 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     let num_updates: u64 = num_updates_arg.unwrap_or(default_updates);
     let proc_num_updates: i64 = (num_updates / size as u64) as i64;
 
-    // Allocate and initialize table
-    let mut table: Vec<u64> = vec![0; local_table_size as usize];
-    init_table(&mut table, global_start);
+    // The table is allocated by UCX in a shared segment (UCP_MEM_MAP_ALLOCATE)
+    // inside create_multiprocess, so peers can reach it via RMA atomics.
+    // We build a slice over the UCX-allocated pointer for local updates/verify.
+    let table_bytes = local_table_size as usize * std::mem::size_of::<u64>();
+    let (_rank, _size, comm_ctx) = create_multiprocess(std::ptr::null_mut(), table_bytes);
+    let table: &mut [u64] = unsafe {
+        std::slice::from_raw_parts_mut(comm_ctx.table_ptr, local_table_size as usize)
+    };
+    init_table(table, global_start);
 
     if rank == 0 {
         println!("Running on {} processors (PowerofTwo)", size);
@@ -166,9 +172,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         );
     }
 
-    // Phase 2: Full UCX + PMIx communication setup (re-init PMIx)
-    let table_bytes = local_table_size as usize * std::mem::size_of::<u64>();
-    let (_rank, _size, comm_ctx) = create_multiprocess(table.as_mut_ptr(), table_bytes);
+
 
     // Barrier to ensure all connections and rkey exchanges are ready
     barrier(&comm_ctx);
@@ -188,7 +192,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
         if remote_proc == rank {
             // Local update — direct XOR
-            apply_update(&mut table, datum, local_mask);
+            apply_update(table, datum, local_mask);
         } else {
             // Remote update — RMA atomic XOR on peer's table
             let target_offset = (datum & local_mask) as usize;
@@ -228,7 +232,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
     let verify_start = Instant::now();
     let errors = verify::verify_table(
-        &table,
+        table,
         local_table_size,
         global_start,
         size as u64,
