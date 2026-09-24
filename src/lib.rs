@@ -4,6 +4,7 @@
 //! for testing, with a binary entry point in `main.rs`.
 
 pub mod comm;
+pub mod oob;
 pub mod rng;
 pub mod table;
 pub mod verify;

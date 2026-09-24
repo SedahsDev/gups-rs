@@ -2,23 +2,24 @@
 //!
 //! Replicates the HPC Challenge GUPS benchmark using UCX for communication.
 //!
-//! ## Modes
+//! Uses UCX Remote Memory Access with atomic XOR for direct remote table
+//! updates. Pattern derived from the osss-ucx SHMEM implementation.
 //!
-//! **Single-process** (`--single`): No UCX needed, validates the algorithm locally.
+//! ## Requirements
 //!
-//! **Multi-process** (RMA atomics): Uses UCX Remote Memory Access with atomic XOR
-//! for direct remote table updates. Pattern derived from osss-ucx SHMEM implementation.
+//! This benchmark is **multi-process only**. It bootstraps through PMIx, so it
+//! must be launched under a PMIx job launcher such as `prterun`. There is no
+//! local/single-process mode: UCX RMA atomics require a transport that supports
+//! remote atomics (InfiniBand or RoCE). Running the binary outside a launcher
+//! exits with an error rather than silently benchmarking a local path.
 //!
 //! ## Usage
 //! ```text
-//! # Single-process mode (no UCX needed, validates algorithm):
-//! gups-rs --single
-//!
-//! # Multi-process mode (requires UCX, run via prterun or similar):
 //! prterun -np 2 ./gups-rs
 //! ```
 
 mod comm;
+mod oob;
 mod rng;
 mod table;
 mod verify;
@@ -36,7 +37,6 @@ fn print_usage() {
     eprintln!("Usage: gups-rs [options]");
     eprintln!("  -t, --table-size SIZE    Table size as power of 2 (default: auto, half of RAM)");
     eprintln!("  -u, --updates COUNT      Number of updates (default: 4x table size)");
-    eprintln!("  --single                 Run in single-process mode (no UCX)");
     eprintln!("  -h, --help               Show help");
 }
 
@@ -74,119 +74,8 @@ fn auto_table_size(num_procs: u64) -> u64 {
     size
 }
 
-/// Single-process mode: no UCX, all updates are local
-fn run_single(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
-    let num_procs: u64 = 1;
-    let log_num_procs: u64 = 0;
-
-    let table_size = match table_size_log {
-        Some(log) => 1u64 << log,
-        None => auto_table_size(num_procs),
-    };
-
-    let local_table_size = table_size / num_procs;
-    let log_table_size = log2_floor(table_size);
-    let log_table_local = log_table_size - log_num_procs;
-
-    let default_updates = 4 * table_size;
-    let num_updates: u64 = num_updates_arg.unwrap_or(default_updates);
-    let proc_num_updates: i64 = (num_updates / num_procs) as i64;
-
-    let mut table: Vec<u64> = vec![0; local_table_size as usize];
-    init_table(&mut table, 0);
-
-    println!("Running on {} processors (PowerofTwo)", num_procs);
-    println!(
-        "Total Main table size = 2^{} = {} words",
-        log_table_size, table_size
-    );
-    println!(
-        "PE Main table size = 2^{} = {} words/PE",
-        log_table_local, local_table_size
-    );
-    println!(
-        "Default number of updates (RECOMMENDED) = {}",
-        default_updates
-    );
-
-    #[allow(clippy::erasing_op)]
-    let mut ran = starts(4 * 0); // single-process: rank=0, so 4*0 is correct
-    let local_mask = local_table_size - 1;
-
-    // Warm-up (discarded): stabilize caches / branch predictors
-    let warmup = (proc_num_updates / 100).clamp(1, 10_000);
-    for _ in 0..warmup {
-        ran = lfsr_step(ran);
-        apply_update(&mut table, ran as u64, local_mask);
-    }
-    // Re-init table after warm-up so verification baseline stays correct
-    init_table(&mut table, 0);
-    // single-process: rank=0, so 4*0 is correct (matches C ref: starts(4*GlobalStartMyProc))
-    #[allow(clippy::erasing_op)]
-    let start_val: u64 = 4 * 0;
-    ran = starts(start_val);
-
-    let start = Instant::now();
-
-    for _ in 0..proc_num_updates {
-        ran = lfsr_step(ran);
-        let datum = ran as u64;
-        apply_update(&mut table, datum, local_mask);
-    }
-
-    let elapsed = start.elapsed();
-    let real_time = elapsed.as_secs_f64();
-
-    let gups = (num_updates as f64 * 1e-9) / real_time;
-    let gups_per_pe = gups / num_procs as f64;
-
-    println!("Real time used = {:.6} seconds", real_time);
-    println!("{:.9} Billion(10^9) Updates    per second [GUP/s]", gups);
-    println!(
-        "{:.9} Billion(10^9) Updates/PE per second [GUP/s]",
-        gups_per_pe
-    );
-
-    let verify_start = Instant::now();
-    let errors = verify::verify_table(
-        &table,
-        local_table_size,
-        0,
-        num_procs,
-        log_num_procs,
-        log_table_size,
-        proc_num_updates,
-        0,
-    );
-    let verify_elapsed = Instant::now().duration_since(verify_start).as_secs_f64();
-
-    let status = if errors as f64 <= 0.01 * table_size as f64 {
-        "passed"
-    } else {
-        "failed"
-    };
-
-    println!(
-        "Verification:  Real time used = {:.6} seconds",
-        verify_elapsed
-    );
-    println!(
-        "Found {} errors in {} locations ({}).",
-        errors, table_size, status
-    );
-}
-
-/// Multi-process mode: uses OpenSHMEM for lifecycle and collectives, with the
-/// direct-table compatibility path for the current application-owned Vec.
-#[cfg(not(feature = "ucc"))]
-fn run_multi(_table_size_log: Option<u64>, _num_updates_arg: Option<u64>) {
-    eprintln!(
-        "Multi-process mode requires the 'ucc' feature. Rebuild with --features ucc (or default features)."
-    );
-    process::exit(1);
-}
-
-#[cfg(feature = "ucc")]
+/// Multi-process mode: uses UCX RMA atomics for direct remote table updates.
+/// Rank and size are obtained from PMIx internally by create_multiprocess().
 fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     // create_multiprocess() handles PMIx init, rank/size discovery, UCX setup,
     // and rkey exchange. It returns (rank, size, CommCtx).
@@ -200,17 +89,37 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     // Even simpler: just allocate a dummy page and pass it,
     // then re-register after we know the real size.
     //
-    // OpenSHMEM owns the process lifecycle and collective runtime. The direct
-    // communication adapter below is retained only for the application-owned
-    // Vec<u64> table, which the current layer cannot register.
-    if let Err(error) = openshmem::init::init() {
-        eprintln!("OpenSHMEM initialization failed: {error:?}");
-        process::exit(1);
-    }
+    // Phase 1: Connect once to learn rank/size, then keep the process session live.
+    // create_multiprocess reuses a Live PmixClient (no second PMIx_Init — re-init
+    // after disconnect is not supported by the session state machine).
+    let pmix_probe = match pmix::PmixClient::connect_new(None) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("PMIx connect failed: {error:?}");
+            eprintln!(
+                "gups-rs is multi-process only and must run under a PMIx launcher, \
+                 e.g. prterun -np 2 ./gups-rs"
+            );
+            process::exit(1);
+        }
+    };
+    let rank = pmix_probe.require_rank() as usize;
 
-    // Learn rank and size through OpenSHMEM rather than PMIx directly.
-    let rank = openshmem::init::my_pe().expect("OpenSHMEM rank") as usize;
-    let size = openshmem::init::n_pes().expect("OpenSHMEM size");
+    // Query pmix.job.size via wildcard proc, fall back to PMIX_SIZE env var
+    let wc_proc = pmix_probe
+        .proc_with_nspace(pmix::RANK_WILDCARD)
+        .expect("wildcard_proc");
+    let size = pmix::get_value(&wc_proc, pmix::JOB_SIZE, None)
+        .ok()
+        .map(|v| v.uint32() as usize)
+        .or_else(|| env::var("PMIX_SIZE").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| {
+            eprintln!("Cannot determine job size from PMIx (pmix.job.size) or PMIX_SIZE env var.");
+            process::exit(1);
+        });
+
+    // Drop the probe *handle* only — do not disconnect; session stays Live for CommCtx.
+    drop(pmix_probe);
 
     if size == 1 {
         eprintln!("OpenSHMEM job size is 1 — nothing to do in multi-process mode.");
@@ -240,9 +149,15 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     let num_updates: u64 = num_updates_arg.unwrap_or(default_updates);
     let proc_num_updates: i64 = (num_updates / size as u64) as i64;
 
-    // Allocate and initialize table
-    let mut table: Vec<u64> = vec![0; local_table_size as usize];
-    init_table(&mut table, global_start);
+    // The table is allocated by UCX in a shared segment (UCP_MEM_MAP_ALLOCATE)
+    // inside create_multiprocess, so peers can reach it via RMA atomics.
+    // We build a slice over the UCX-allocated pointer for local updates/verify.
+    let table_bytes = local_table_size as usize * std::mem::size_of::<u64>();
+    let (_rank, _size, comm_ctx) = create_multiprocess(std::ptr::null_mut(), table_bytes);
+    let table: &mut [u64] = unsafe {
+        std::slice::from_raw_parts_mut(comm_ctx.table_ptr, local_table_size as usize)
+    };
+    init_table(table, global_start);
 
     if rank == 0 {
         println!("Running on {} processors (PowerofTwo)", size);
@@ -260,20 +175,50 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
         );
     }
 
-    // Phase 2: direct-UCX compatibility setup for the application-owned table
-    let table_bytes = local_table_size as usize * std::mem::size_of::<u64>();
-    let (_rank, _size, comm_ctx) = create_multiprocess(table.as_mut_ptr(), table_bytes);
+
 
     // Barrier to ensure all connections and rkey exchanges are ready
     barrier(&comm_ctx);
-
-    // Initialize RNG
+    
+    // WARMUP PHASE (fix for issue #10 and #13):
+    // Perform a warmup set of updates before the timed loop to:
+    // 1. Avoid first-touch / registration cost contaminating results
+    // 2. Allow lazy connection setup to complete
+    // 3. Warm up CPU caches and frequency scaling
+    let warmup_iterations = std::cmp::min(num_updates / 10, 1000);
+    if rank == 0 {
+        eprintln!("[gups-rs] WARMUP: performing {} warmup updates...", warmup_iterations);
+    }
+    let mut warmup_ran = starts(4 * global_start) as i64;
+    let local_mask = local_table_size - 1;
+    let proc_mask = size as i64 - 1;
+    
+    for _iteration in 0..warmup_iterations {
+        warmup_ran = lfsr_step(warmup_ran);
+        let remote_proc = ((warmup_ran >> log_table_local) & proc_mask) as usize;
+        let datum = warmup_ran as u64;
+        
+        if remote_proc == rank {
+            apply_update(table, datum, local_mask);
+        } else {
+            let target_offset = (datum & local_mask) as usize;
+            atomic_xor_remote(&comm_ctx, remote_proc, target_offset, datum);
+        }
+    }
+    // Quiet + barrier to ensure warmup completes
+    barrier(&comm_ctx);
+    if rank == 0 {
+        eprintln!("[gups-rs] WARMUP: done");
+    }
+    
+    // Initialize RNG for timed phase
     let mut ran = starts(4 * global_start) as i64;
     let local_mask = local_table_size - 1;
     let proc_mask = size as i64 - 1;
-
+    
     // Timed update phase
     let start = Instant::now();
+    eprintln!("[gups-rs] STEP: update loop start, {} iters", proc_num_updates);
 
     for _iteration in 0..proc_num_updates {
         ran = lfsr_step(ran);
@@ -282,7 +227,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
         if remote_proc == rank {
             // Local update — direct XOR
-            apply_update(&mut table, datum, local_mask);
+            apply_update(table, datum, local_mask);
         } else {
             // Remote update — RMA atomic XOR on peer's table
             let target_offset = (datum & local_mask) as usize;
@@ -298,6 +243,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
     // Final progress to ensure all pending atomics are flushed
     progress(&comm_ctx);
+    eprintln!("[gups-rs] STEP: update loop done");
 
     let elapsed = start.elapsed();
     let real_time = elapsed.as_secs_f64();
@@ -322,7 +268,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
     let verify_start = Instant::now();
     let errors = verify::verify_table(
-        &table,
+        table,
         local_table_size,
         global_start,
         size as u64,
@@ -361,7 +307,6 @@ fn main() {
 
     let mut table_size_log: Option<u64> = None;
     let mut num_updates_arg: Option<u64> = None;
-    let mut single_mode = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -384,9 +329,6 @@ fn main() {
                     }));
                 }
             }
-            "--single" => {
-                single_mode = true;
-            }
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -400,17 +342,13 @@ fn main() {
         i += 1;
     }
 
-    if single_mode {
-        run_single(table_size_log, num_updates_arg);
-    } else {
-        // If PMIX_RANK env var is set, we're under prterun — use multi-process mode.
-        // create_multiprocess() gets rank/size from PMIx directly.
-        let under_pmix = env::var("PMIX_RANK").is_ok();
-        if under_pmix {
-            run_multi(table_size_log, num_updates_arg);
-        } else {
-            // No PMIx env vars detected — fall back to single-node mode
-            run_single(table_size_log, num_updates_arg);
-        }
+    // Multi-process only: there is no local fallback. If we are not under a PMIx
+    // launcher, fail loudly instead of silently benchmarking a local path.
+    if env::var("PMIX_RANK").is_err() {
+        eprintln!("gups-rs must be launched under a PMIx launcher (e.g. prterun -np 2 ./gups-rs).");
+        eprintln!("PMIX_RANK is not set, so no job rank could be determined.");
+        process::exit(1);
     }
+
+    run_multi(table_size_log, num_updates_arg);
 }
