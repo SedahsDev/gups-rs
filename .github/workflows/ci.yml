@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # All five repositories are checked out below workflow/, making these paths
+  # All four repositories are checked out below workflow/, making these paths
   # siblings as required by gups-rs/Cargo.toml.
   PMIX_PREFIX: ${{ github.workspace }}/pmix-install
   UCX_PREFIX: /usr
@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: SedahsDev/ucx-rs
-          ref: master
+          ref: main
           path: workflow/ucx-rs
 
       - name: Check out pmix-rs

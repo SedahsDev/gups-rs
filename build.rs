@@ -52,12 +52,15 @@ fn discover_ucc() -> (PathBuf, PathBuf) {
 }
 
 fn main() {
-    let (_include_dir, lib_dir) = discover_ucc();
+    // Only link UCC when the `ucc` feature is enabled.
+    if env::var("CARGO_FEATURE_UCC").is_ok() {
+        let (_include_dir, lib_dir) = discover_ucc();
 
-    // Propagate UCC native lib search path and rpath to downstream binaries
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=ucc");
-    // Use RPATH (not RUNPATH) so the library is found at runtime without LD_LIBRARY_PATH
-    println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+        // Propagate UCC native lib search path and rpath to downstream binaries
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        println!("cargo:rustc-link-lib=ucc");
+        // Use RPATH (not RUNPATH) so the library is found at runtime without LD_LIBRARY_PATH
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    }
 }

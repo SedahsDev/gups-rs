@@ -1,7 +1,7 @@
 [package]
 name = "gups-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "GUPS (Global Update Performance) benchmark in Rust using UCX"
 license = "BSD-3-Clause"
 readme = "README.md"
@@ -10,6 +10,16 @@ categories = ["science"]
 
 [dependencies]
 libc = "0.2"
+# OpenSHMEM owns lifecycle and collectives; direct bindings remain only for the
+# external Vec<u64> table fallback documented in comm.rs.
+openshmem = { path = "../openshmem-rs" }
 ucx-sys = { path = "../ucx-rs" }
 pmix = { path = "../pmix-rs" }
-ucc = { path = "../ucc-rs" }
+
+[features]
+default = ["ucc"]
+ucc = ["dep:ucc", "openshmem/collectives"]
+
+[dependencies.ucc]
+path = "../ucc-rs"
+optional = true

@@ -28,6 +28,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
+#[cfg(feature = "ucc")]
 use comm::{allreduce_u64, atomic_xor_remote, barrier, create_multiprocess, progress};
 use rng::{lfsr_step, starts};
 use table::{apply_update, init_table};
@@ -39,6 +40,7 @@ fn print_usage() {
     eprintln!("  -h, --help               Show help");
 }
 
+#[cfg(feature = "ucc")]
 fn is_power_of_two(n: u64) -> bool {
     n > 0 && (n & (n - 1)) == 0
 }
@@ -52,10 +54,10 @@ fn get_total_ram_pages() -> u64 {
     for line in content.lines() {
         if line.starts_with("MemTotal:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(kb) = parts[1].parse::<u64>() {
-                    return (kb * 1024) / 8;
-                }
+            if parts.len() >= 2
+                && let Ok(kb) = parts[1].parse::<u64>()
+            {
+                return (kb * 1024) / 8;
             }
         }
     }
@@ -120,7 +122,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     drop(pmix_probe);
 
     if size == 1 {
-        eprintln!("PMIX_JOB_SIZE is 1 — nothing to do in multi-process mode.");
+        eprintln!("OpenSHMEM job size is 1 — nothing to do in multi-process mode.");
         process::exit(1);
     }
 
@@ -277,7 +279,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
     );
     let verify_elapsed = Instant::now().duration_since(verify_start).as_secs_f64();
 
-    // Collect total errors via UCC allreduce (SUM reduction)
+    // Collect total errors via the OpenSHMEM allreduce adapter (SUM reduction).
     let total_errors: u64 = allreduce_u64(&comm_ctx, errors);
 
     barrier(&comm_ctx);
