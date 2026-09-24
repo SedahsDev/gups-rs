@@ -31,6 +31,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Checkout openshmem-rs (added in Issue #11 fix)
+      - name: Checkout openshmem-rs
+        uses: actions/checkout@v4
+        with:
+          repository: SedahsDev/openshmem-rs
+          ref: master
+          path: openshmem-rs
+
       # When run from monorepo mirror with all crates present:
       - name: Unit tests (monorepo layout)
         if: hashFiles('../ucx-rs/Cargo.toml') != '' || hashFiles('ucx-rs/Cargo.toml') != ''

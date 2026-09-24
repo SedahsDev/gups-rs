@@ -19,6 +19,7 @@
 //! ```
 
 mod comm;
+mod oob;
 mod rng;
 mod table;
 mod verify;
@@ -176,14 +177,46 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
     // Barrier to ensure all connections and rkey exchanges are ready
     barrier(&comm_ctx);
-
-    // Initialize RNG
+    
+    // WARMUP PHASE (fix for issue #10 and #13):
+    // Perform a warmup set of updates before the timed loop to:
+    // 1. Avoid first-touch / registration cost contaminating results
+    // 2. Allow lazy connection setup to complete
+    // 3. Warm up CPU caches and frequency scaling
+    let warmup_iterations = std::cmp::min(num_updates / 10, 1000);
+    if rank == 0 {
+        eprintln!("[gups-rs] WARMUP: performing {} warmup updates...", warmup_iterations);
+    }
+    let mut warmup_ran = starts(4 * global_start) as i64;
+    let local_mask = local_table_size - 1;
+    let proc_mask = size as i64 - 1;
+    
+    for _iteration in 0..warmup_iterations {
+        warmup_ran = lfsr_step(warmup_ran);
+        let remote_proc = ((warmup_ran >> log_table_local) & proc_mask) as usize;
+        let datum = warmup_ran as u64;
+        
+        if remote_proc == rank {
+            apply_update(table, datum, local_mask);
+        } else {
+            let target_offset = (datum & local_mask) as usize;
+            atomic_xor_remote(&comm_ctx, remote_proc, target_offset, datum);
+        }
+    }
+    // Quiet + barrier to ensure warmup completes
+    barrier(&comm_ctx);
+    if rank == 0 {
+        eprintln!("[gups-rs] WARMUP: done");
+    }
+    
+    // Initialize RNG for timed phase
     let mut ran = starts(4 * global_start) as i64;
     let local_mask = local_table_size - 1;
     let proc_mask = size as i64 - 1;
-
+    
     // Timed update phase
     let start = Instant::now();
+    eprintln!("[gups-rs] STEP: update loop start, {} iters", proc_num_updates);
 
     for _iteration in 0..proc_num_updates {
         ran = lfsr_step(ran);
@@ -208,6 +241,7 @@ fn run_multi(table_size_log: Option<u64>, num_updates_arg: Option<u64>) {
 
     // Final progress to ensure all pending atomics are flushed
     progress(&comm_ctx);
+    eprintln!("[gups-rs] STEP: update loop done");
 
     let elapsed = start.elapsed();
     let real_time = elapsed.as_secs_f64();

@@ -166,9 +166,16 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     eprintln!("[gups-rs] PMIx rank={}, size={}", rank, size);
 
     // 3. Initialize UCX context
-    // Tag + Rma + ExportedMemH — Amo64 not needed as a context flag;
-    // amo_xor64 works on RMA endpoints without explicit Amo64 feature.
-    let features = context::Flags::Tag | context::Flags::Rma | context::Flags::ExportedMemH;
+        // Tag + Rma — Amo64 not needed as a context flag; amo_xor64 works on RMA
+        // endpoints without explicit Amo64 feature.
+        // NOTE: do NOT request UCP_FEATURE_EXPORTED_MEMH here. That feature forces
+        // UCX's RMA lane selection to require UCT_MD_FLAG_REG (select.c), which
+        // sysv/posix shared-memory transports do not advertise — so on a no-RDMA
+        // box the EP create fails with "no memory registration". Without it, UCX
+        // falls through to the "allocated" pass (UCT_MD_FLAG_ALLOC) and selects
+        // sysv/posix for the RMA lane. We use the legacy pack_rkey/ep_rkey_unpack
+        // path, so EXPORTED_MEMH is not needed.
+    let features = context::Flags::Tag | context::Flags::Rma | context::Flags::Amo64;
     let ctx_params = context::ParamsBuilder::new()
         .features(features)
         .estimated_num_eps(size - 1)
@@ -197,13 +204,13 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     eprintln!("[gups-rs] mem_map OK, addr={:p}", memh.query().expect("q").address());
 
     // 6. Pack own worker address (now advertises the sm transport)
+    eprintln!("[gups-rs] STEP: about to pack_address");
     let packed_addr = worker.pack_address().expect("Worker address pack");
     let own_addr_bytes = packed_addr.to_vec();
 
     // 7. Pack rkey for our memory using legacy ucp_rkey_pack
     // (works on all memory domains including self/sysv/posix)
     let packed_rkey = memh::pack_rkey(&uctx, &memh).expect("Rkey pack");
-    // ucp_rkey_pack returns: [4 bytes LE length][rkey data]
     // For ep_rkey_unpack, pass the raw buffer pointer directly
     let rkey_data = packed_rkey.as_bytes();
 
@@ -238,8 +245,12 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
     put_value(GLOBAL, &table_key, &mut table_val).expect("PMIx_Put table_addr");
 
     // 10. Commit + Fence (barrier + data exchange)
+    // Use wildcard proc to cover ALL ranks, not just self (fix for issue #10)
     commit().expect("PMIx_Commit");
-    fence(&my_proc, None).expect("PMIx_Fence");
+    let wc_proc = pmix_ctx
+        .proc_with_nspace(RANK_WILDCARD)
+        .expect("wildcard_proc");
+    fence(&wc_proc, None).expect("PMIx_Fence");
 
     // 11. Retrieve peer data via PMIx_Get
     let mut peer_addrs: Vec<Vec<u8>> = vec![Vec::new(); size];
@@ -282,7 +293,9 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
             } else {
                 let remote_addr = RemoteWorkerAddress::new(peer_addrs[p].clone());
                 let ep_params = ep::ParamsBuilder::new().address(&remote_addr).build();
-                Some(worker.create_ep(ep_params).expect("EP create for peer"))
+                let ep = worker.create_ep(ep_params).expect("EP create for peer");
+                eprintln!("[gups-rs] STEP: created EP to peer {}", p);
+                Some(ep)
             }
         })
         .collect();
@@ -315,11 +328,26 @@ pub fn create_multiprocess(table_base: *mut u64, table_bytes: usize) -> (usize, 
 
     // 15. Initialize UCC for collective operations (barrier, allreduce, etc.)
     let ucc_lib = UccLib::init().expect("UCC library init");
-    let ucc_context = UccContext::new(ucc_lib.clone()).expect("UCC context create");
 
-    // Create UCC team with explicit size
+    // UCC requires an OOB (out-of-band) allgather for BOTH context and team
+    // creation when no EP map is provided. Without it, UCC's address exchange
+    // calls a null function pointer and segfaults. We back the OOB with PMIx
+    // put/get. Create it once and reuse for context + team.
+    let oob = unsafe { crate::oob::pmix_oob(&pmix_ctx, rank as u32, size as u32) };
+
+    // Create UCC context with the OOB.
+    let mut ucc_ctx_params = ucc::context::UccContextParams::default();
+    ucc_ctx_params.with_oob(oob);
+    let ucc_context =
+        UccContext::with_params(ucc_lib.clone(), ucc_ctx_params).expect("UCC context create");
+
+    // Create UCC team with explicit size + the same OOB.
     let mut ucc_team_params = UccTeamParams::default();
     ucc_team_params.with_team_size(size as u64);
+    ucc_team_params.with_oob(oob);
+    // UCC requires params.ep to match oob.oob_ep (the rank). The default is 0,
+    // which only matches rank 0 — set it to our rank.
+    ucc_team_params.inner_mut().ep = rank as u64;
     let ucc_team =
         UccTeam::with_params(ucc_context.clone(), ucc_team_params).expect("UCC team create");
 
@@ -353,13 +381,66 @@ pub fn atomic_xor_remote(comm: &CommCtx, peer: usize, offset: usize, value: u64)
     let rkey = comm.remote_rkeys[peer].as_ref().expect("rkey for peer");
     let ep = comm.endpoints[peer].as_ref().expect("endpoint for peer");
 
-    let param = RequestParamBuilder::new().build();
+    // UCX requires the datatype to be set on the atomic op request
+    // (UCP_OP_ATTR_FIELD_DATATYPE) — otherwise ucp_atomic_op_nbx fails with
+    // "missing atomic operation datatype". Use a contiguous 8-byte datatype
+    // for the 64-bit XOR.
+    let mut param_builder = RequestParamBuilder::new();
+    param_builder.datatype(ucx_sys::dt::dt_make_contig(8));
+    let param = param_builder.build();
     let result = ep.amo_xor64(value, remote_addr, rkey, &param);
-    if let Err(e) = result {
-        eprintln!(
-            "atomic_xor64 failed on peer {} offset {}: {:?}",
-            peer, offset, e
-        );
+    match result {
+        Err(e) => {
+            eprintln!(
+                "atomic_xor64 failed on peer {} offset {}: {:?}",
+                peer, offset, e
+            );
+        }
+        Ok(Some(req)) => {
+            // Non-blocking op returned an in-flight request. We must keep it
+            // alive and progress until it completes — dropping it would free
+            // the request and abandon the atomic before it lands on the remote
+            // table (this was silently losing ~50% of remote updates).
+            let req = req;
+            loop {
+                match req.check_finished() {
+                    Ok(true) => break,
+                    Ok(false) => {
+                        progress(comm);
+                        std::thread::yield_now();
+                    }
+                    Err(e) => {
+                        eprintln!("atomic_xor64 request error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            // Completed synchronously (UCS_OK).
+        }
+    }
+
+    // Guarantee delivery: flush the endpoint so all previously issued atomics
+    // on this EP are known to be delivered to the remote side before we return.
+    // Without this, a later barrier can complete while an in-flight atomic is
+    // still buffered, and it lands AFTER verification reads the table.
+    let flush_req = ep.flush_nbx();
+    if !flush_req.is_live() {
+        return;
+    }
+    loop {
+        match flush_req.check_finished() {
+            Ok(true) => break,
+            Ok(false) => {
+                progress(comm);
+                std::thread::yield_now();
+            }
+            Err(e) => {
+                eprintln!("ep flush failed on peer {}: {:?}", peer, e);
+                break;
+            }
+        }
     }
 }
 
@@ -374,15 +455,31 @@ pub fn progress(comm: &CommCtx) {
 
 /// Barrier across all processes using UCC collective barrier.
 ///
-/// Uses `init_and_post` which is synchronous — blocks until the collective
-/// completes. Replaces the previous tag-message-based barrier.
+/// Uses `init` + `post` + poll `test()` (synchronous). `ucc_collective_init_and_post`
+/// is not implemented in this UCC build, so we init, post, then spin on `test()`
+/// until the collective completes.
 pub fn barrier(comm: &CommCtx) {
     let mut stub = [0u8];
     let mut req = CollectiveBuilder::new(UccCollectiveType::Barrier)
         .with_inplace(&mut stub)
         .with_count(1)
-        .init_and_post(&comm.ucc_team)
-        .expect("UCC barrier post");
+        .init(&comm.ucc_team)
+        .expect("UCC barrier init");
+    req.post().expect("UCC barrier post");
+    // Spin until the collective completes (poll the raw request status).
+    // Must progress the UCX worker so the UCC collective can make progress.
+    loop {
+        let done = unsafe {
+            (*req.request()).status == ucc::bindings::ucc_status_t_UCC_OK
+        };
+        if done {
+            break;
+        }
+        // Progress the UCC context (UCC collectives use their own internal
+        // UCP transport, so the gups-rs UCX worker progress is not enough).
+        comm.ucc_context.progress();
+        std::thread::yield_now();
+    }
     let _ = req.finalize();
 }
 
@@ -391,8 +488,8 @@ pub fn barrier(comm: &CommCtx) {
 /// Uses SUM reduction to aggregate values from all ranks. The result
 /// is the same on all processes after completion.
 ///
-/// Uses `init_and_post` which is synchronous — blocks until the collective
-/// completes. Replaces the previous tag-message-based reduction pattern.
+/// Uses `init` + `post` + poll `test()` (synchronous). `ucc_collective_init_and_post`
+/// is not implemented in this UCC build, so we init, post, then spin on `test()`.
 pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
     let mut buf = [value];
     let bytes: &mut [u8] = unsafe {
@@ -403,8 +500,23 @@ pub fn allreduce_u64(comm: &CommCtx, value: u64) -> u64 {
         .with_count(1)
         .with_dtype(8) // UCC_DT_UINT64 (DataType::Uint64)
         .with_reduction_op(UccReductionOp::Sum)
-        .init_and_post(&comm.ucc_team)
-        .expect("UCC allreduce post");
+        .init(&comm.ucc_team)
+        .expect("UCC allreduce init");
+    req.post().expect("UCC allreduce post");
+    // Spin until the collective completes (poll the raw request status).
+    // Must progress the UCX worker so the UCC collective can make progress.
+    loop {
+        let done = unsafe {
+            (*req.request()).status == ucc::bindings::ucc_status_t_UCC_OK
+        };
+        if done {
+            break;
+        }
+        // Progress the UCC context (UCC collectives use their own internal
+        // UCP transport, so the gups-rs UCX worker progress is not enough).
+        comm.ucc_context.progress();
+        std::thread::yield_now();
+    }
     let _ = req.finalize();
     buf[0]
 }
